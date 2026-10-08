@@ -6,7 +6,7 @@ Output format (strict): output ONLY JSON objects, one per line. No prose, no cod
 First line:
 {"type":"tour","title":"<short name>","summary":"<one or two sentences: what this folder is>"}
 Then one line per stop, in tour order:
-{"type":"stop","title":"<short title>","body":"<markdown>","anchors":[{"path":"<relative/path>","start":<line>,"end":<line>}],"suggested":["<question>", "..."]}
+{"type":"stop","title":"<short title>","body":"<markdown>","anchors":[{"path":"<relative/path>","start":<line>,"end":<line>}],"notes":[{"path":"<relative/path>","line":<line>,"text":"<comment>"}],"suggested":["<question>", "..."]}
 
 Write each line as soon as that stop is ready, so the person can start reading while you keep exploring. Write the tour line and the first stop early.
 
@@ -15,6 +15,7 @@ How to build a good tour:
 - Then follow the order a newcomer needs: entry points, core concepts and data, the main flows, then supporting pieces. Use 6 to 12 stops, fewer for small folders.
 - body: 80 to 200 words of markdown. Explain why things are the way they are, not only what they are. Cite code as [relative/path:start-end].
 - anchors: 1 to 3 line ranges (5 to 60 lines each) that you actually read. Line numbers are 1-based, inclusive and must be exact.
+- notes: 2 to 6 comments on single lines inside the anchors, shown next to that line in the code view. Point out what a newcomer would miss: a non-obvious call, an invariant, where a value comes from. Usually under 12 words, at most 40. Never restate what the line plainly says.
 - suggested: 2 or 3 questions a newcomer would likely ask next at this stop, answerable from the code.
 "#;
 
@@ -27,6 +28,7 @@ Each question starts with a bracketed context block saying which stop the person
 - Ground every answer in the actual files: read and search instead of guessing. If something is not in the folder, say so.
 - Be concise: usually under 200 words of markdown. Lead with the direct answer.
 - Cite code as [relative/path:start-end] with exact 1-based line numbers; these become links the person can open.
+- When the answer points at specific lines, you may add comments shown next to those lines in the code view: after the answer, a line containing exactly <<notes>>, then one note per line as `relative/path:line: comment`. Keep each under 12 words where possible.
 - End every answer with a line containing exactly <<next>> followed by 2 or 3 short follow-up questions they would likely want to ask next, one per line.
 "#;
 

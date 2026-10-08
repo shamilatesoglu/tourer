@@ -1,18 +1,23 @@
 //! A minimal MCP server over stdio, so other agents can take tours: `tourer --mcp`.
 //! It speaks just enough JSON-RPC for tools: initialize, ping, tools/list and tools/call.
+//! Tool calls are passed to the daemon, which runs them with [`call`] on the shared tour.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
+use crate::agent::Agent;
+use crate::daemon::{self, Client, Reply, Request, Shared};
 use crate::engine::{AnswerState, Engine};
+use crate::tour::{Anchor, Note};
 
 const PLAN_WAIT: Duration = Duration::from_secs(60);
 const ANSWER_WAIT: Duration = Duration::from_secs(300);
@@ -21,25 +26,26 @@ const INSTRUCTIONS: &str = "tourer gives guided tours of folders and codebases y
 Call `tour` first to get the outline, read stops in order with `stop`, and use `ask` for anything \
 you want explained. Answers cite code as [path:start-end].";
 
-/// One tour being planned or taken, shared between request threads.
-struct Shared {
-    engine: Mutex<Engine>,
-    changed: Condvar,
-}
-
 struct Server {
     default_root: PathBuf,
+    agent: Agent,
     model: Option<String>,
-    tours: Mutex<HashMap<PathBuf, Arc<Shared>>>,
     out: Mutex<std::io::Stdout>,
+    daemon: Mutex<Option<Client>>,
+    /// JSON-RPC ids of tool calls the daemon is working on, by our own call id.
+    pending: Mutex<HashMap<u64, Value>>,
+    next_call: AtomicU64,
 }
 
-pub fn serve(default_root: PathBuf, model: Option<String>) -> Result<()> {
+pub fn serve(default_root: PathBuf, agent: Agent, model: Option<String>) -> Result<()> {
     let server = Arc::new(Server {
         default_root,
+        agent,
         model,
-        tours: Mutex::new(HashMap::new()),
         out: Mutex::new(std::io::stdout()),
+        daemon: Mutex::new(None),
+        pending: Mutex::new(HashMap::new()),
+        next_call: AtomicU64::new(1),
     });
     for line in std::io::stdin().lock().lines() {
         let Ok(msg) = serde_json::from_str::<Value>(&line?) else { continue };
@@ -60,14 +66,9 @@ pub fn serve(default_root: PathBuf, model: Option<String>) -> Result<()> {
             "ping" => server.reply(id, Ok(json!({}))),
             "tools/list" => server.reply(id, Ok(json!({"tools": tools()}))),
             "tools/call" => {
-                let server = server.clone();
-                thread::spawn(move || {
-                    let result = match server.call(&params) {
-                        Ok(text) => json!({"content": [{"type": "text", "text": text}]}),
-                        Err(e) => json!({"content": [{"type": "text", "text": e.to_string()}], "isError": true}),
-                    };
-                    server.reply(id, Ok(result));
-                });
+                if let Err(err) = server.forward(id.clone(), &params) {
+                    server.reply_tool(id, format!("{err:#}"), true);
+                }
             }
             _ => server.reply(id, Err((-32601, format!("unknown method {method}")))),
         }
@@ -114,89 +115,111 @@ impl Server {
         let _ = out.flush();
     }
 
-    fn call(&self, params: &Value) -> Result<String> {
+    fn reply_tool(&self, id: Value, text: String, is_error: bool) {
+        self.reply(id, Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error})));
+    }
+
+    /// Sends a tool call to the daemon, connecting first if needed. The reply comes later.
+    fn forward(self: &Arc<Self>, id: Value, params: &Value) -> Result<()> {
         let args = &params["arguments"];
-        let shared = self.tour(args["path"].as_str())?;
-        let number = |key: &str| args[key].as_u64().map(|n| n.max(1) as usize);
-        match params["name"].as_str().unwrap_or("") {
-            "tour" => {
-                let engine = wait(&shared, PLAN_WAIT, |e| e.planning);
-                Ok(outline(&engine))
-            }
-            "stop" => {
-                let n = number("number").context("`number` is required")?;
-                let engine = wait(&shared, PLAN_WAIT, |e| e.planning && e.tour.stops.len() < n);
-                stop_text(&engine, n)
-            }
-            "ask" => {
-                let q = args["question"].as_str().context("`question` is required")?;
-                let n = number("stop").unwrap_or(1);
-                let mut engine = wait(&shared, PLAN_WAIT, |e| e.planning && e.tour.stops.len() < n);
-                let n = n.min(engine.tour.stops.len());
-                let at = engine.ask(n.saturating_sub(1), q).ok_or_else(|| no_stops(&engine))?;
-                let engine = wait_on(engine, &shared, ANSWER_WAIT, |e| e.answer_state(at) != AnswerState::Done);
-                if engine.answer_state(at) != AnswerState::Done {
-                    return Err(anyhow!("the guide is still answering; ask again later"));
-                }
-                let ex = &engine.tour.stops[at.0].thread[at.1];
-                let mut text = ex.a.clone();
-                if !ex.suggested.is_empty() {
-                    text.push_str("\n\nSuggested follow-up questions:\n");
-                    for s in &ex.suggested {
-                        let _ = writeln!(text, "- {s}");
-                    }
-                }
-                Ok(text)
-            }
-            name => Err(anyhow!("unknown tool {name}")),
-        }
-    }
-
-    /// The tour of a folder, started on first use.
-    fn tour(&self, path: Option<&str>) -> Result<Arc<Shared>> {
-        let path = path.map_or(self.default_root.clone(), |p| self.default_root.join(p));
+        let path = args["path"].as_str().map_or(self.default_root.clone(), |p| self.default_root.join(p));
         let root = path.canonicalize().with_context(|| format!("cannot open {}", path.display()))?;
-        let mut tours = self.tours.lock().unwrap();
-        if let Some(shared) = tours.get(&root) {
-            return Ok(shared.clone());
+        let call = self.next_call.fetch_add(1, Ordering::SeqCst);
+        let request = Request::Tool {
+            id: call,
+            root,
+            agent: self.agent,
+            model: self.model.clone(),
+            name: params["name"].as_str().unwrap_or("").to_string(),
+            arguments: args.clone(),
+        };
+        let mut daemon = self.daemon.lock().unwrap();
+        if daemon.is_none() {
+            let (client, replies) = daemon::connect()?;
+            *daemon = Some(client);
+            let server = self.clone();
+            thread::spawn(move || server.read_replies(replies));
         }
-        let (tx, rx) = mpsc::channel();
-        let engine = Engine::new(root.clone(), self.model.clone(), tx)?;
-        let shared = Arc::new(Shared { engine: Mutex::new(engine), changed: Condvar::new() });
-        let pump = shared.clone();
-        thread::spawn(move || {
-            for (role, event) in rx {
-                pump.engine.lock().unwrap().on_agent(role, event);
-                pump.changed.notify_all();
+        self.pending.lock().unwrap().insert(call, id);
+        let sent = daemon.as_mut().unwrap().send(&request);
+        if sent.is_err() {
+            *daemon = None;
+            self.pending.lock().unwrap().remove(&call);
+        }
+        sent
+    }
+
+    fn read_replies(&self, replies: impl Iterator<Item = Reply>) {
+        for reply in replies {
+            if let Reply::Tool { id, text, is_error } = reply
+                && let Some(rpc_id) = self.pending.lock().unwrap().remove(&id)
+            {
+                self.reply_tool(rpc_id, text, is_error);
             }
-        });
-        tours.insert(root, shared.clone());
-        Ok(shared)
+        }
+        // The daemon went away: fail what it was working on and reconnect on the next call.
+        *self.daemon.lock().unwrap() = None;
+        for (_, rpc_id) in self.pending.lock().unwrap().drain() {
+            self.reply_tool(rpc_id, "lost the connection to the tourer daemon; try again".into(), true);
+        }
     }
 }
 
-fn wait<'a>(shared: &'a Shared, timeout: Duration, busy: impl Fn(&Engine) -> bool) -> MutexGuard<'a, Engine> {
-    wait_on(shared.engine.lock().unwrap(), shared, timeout, busy)
-}
-
-fn wait_on<'a>(
-    guard: MutexGuard<'a, Engine>,
-    shared: &'a Shared,
-    timeout: Duration,
-    busy: impl Fn(&Engine) -> bool,
-) -> MutexGuard<'a, Engine> {
-    shared.changed.wait_timeout_while(guard, timeout, |e| busy(e)).unwrap().0
+/// Runs a tool call on a tour. Called by the daemon.
+pub fn call(shared: &Shared, name: &str, args: &Value) -> Result<String> {
+    let number = |key: &str| args[key].as_u64().map(|n| n.max(1) as usize);
+    let planning_before = |n: usize| move |e: &Engine| e.state.planning && e.state.tour.stops.len() < n;
+    match name {
+        "tour" => Ok(outline(&shared.wait(PLAN_WAIT, |e| e.state.planning))),
+        "stop" => {
+            let n = number("number").context("`number` is required")?;
+            stop_text(&shared.wait(PLAN_WAIT, planning_before(n)), n)
+        }
+        "ask" => {
+            let q = args["question"].as_str().context("`question` is required")?;
+            let n = number("stop").unwrap_or(1);
+            let n = {
+                let engine = shared.wait(PLAN_WAIT, planning_before(n));
+                match n.min(engine.state.tour.stops.len()) {
+                    0 => return Err(no_stops(&engine)),
+                    n => n,
+                }
+            };
+            let at = shared.update(|e| e.ask(n - 1, q)).context("no such stop")?;
+            let engine = shared.wait(ANSWER_WAIT, |e| e.state.answer_state(at) != AnswerState::Done);
+            if engine.state.answer_state(at) != AnswerState::Done {
+                return Err(anyhow!("the guide is still answering; ask again later"));
+            }
+            let ex = engine.state.tour.stops.get(at.0).and_then(|s| s.thread.get(at.1));
+            let ex = ex.context("the tour was planned again while answering")?;
+            let mut text = ex.a.clone();
+            if !ex.notes.is_empty() {
+                text.push_str("\n\nNotes on lines:\n");
+                for n in &ex.notes {
+                    let _ = writeln!(text, "- [{}:{}] {}", n.path, n.line, n.text);
+                }
+            }
+            if !ex.suggested.is_empty() {
+                text.push_str("\n\nSuggested follow-up questions:\n");
+                for s in &ex.suggested {
+                    let _ = writeln!(text, "- {s}");
+                }
+            }
+            Ok(text)
+        }
+        name => Err(anyhow!("unknown tool {name}")),
+    }
 }
 
 fn no_stops(engine: &Engine) -> anyhow::Error {
-    match &engine.error {
+    match &engine.state.error {
         Some(err) => anyhow!("the tour failed: {err}"),
         None => anyhow!("no stops yet; the tour is still being planned"),
     }
 }
 
 fn outline(engine: &Engine) -> String {
-    let tour = &engine.tour;
+    let tour = &engine.state.tour;
     if tour.stops.is_empty() {
         return no_stops(engine).to_string();
     }
@@ -205,7 +228,7 @@ fn outline(engine: &Engine) -> String {
         let anchors: Vec<String> = stop.anchors.iter().map(|a| a.to_string()).collect();
         let _ = writeln!(s, "{}. {} {}", i + 1, stop.title, anchors.join(" "));
     }
-    if engine.planning {
+    if engine.state.planning {
         s.push_str("\nThe tour is still being planned; call `tour` again for the remaining stops.\n");
     }
     s.push_str("\nRead stops in order with `stop`, and `ask` about anything along the way.\n");
@@ -213,17 +236,18 @@ fn outline(engine: &Engine) -> String {
 }
 
 fn stop_text(engine: &Engine, n: usize) -> Result<String> {
-    let tour = &engine.tour;
+    let tour = &engine.state.tour;
     let stop = tour.stops.get(n - 1).ok_or_else(|| match tour.stops.len() {
         0 => no_stops(engine),
-        len => anyhow!("there are {len} stops{}", if engine.planning { " so far" } else { "" }),
+        len => anyhow!("there are {len} stops{}", if engine.state.planning { " so far" } else { "" }),
     })?;
     let mut s = format!("# Stop {n}/{}: {}\n\n{}\n", tour.stops.len(), stop.title, stop.body);
     if !stop.anchors.is_empty() {
         s.push_str("\n## Code\n");
     }
     for a in &stop.anchors {
-        let _ = write!(s, "\n### {a}\n```\n{}```\n", excerpt(engine.root(), &a.path, a.start, a.end));
+        let notes = stop.notes_in(&a.path);
+        let _ = write!(s, "\n### {a}\n```\n{}```\n", excerpt(engine.root(), a, &notes));
     }
     for ex in &stop.thread {
         let _ = write!(s, "\n## Q: {}\n\n{}\n", ex.q, if ex.a.is_empty() { "(not answered yet)" } else { &ex.a });
@@ -238,14 +262,18 @@ fn stop_text(engine: &Engine, n: usize) -> Result<String> {
     Ok(s)
 }
 
-/// Numbered lines from a file, capped so a bad range cannot flood the caller.
-fn excerpt(root: &Path, path: &str, start: usize, end: usize) -> String {
-    let Ok(bytes) = std::fs::read(root.join(path)) else { return "(file not found)\n".into() };
+/// Numbered lines from a file with the guide's notes under them, capped so a bad range
+/// cannot flood the caller.
+fn excerpt(root: &Path, a: &Anchor, notes: &[&Note]) -> String {
+    let Ok(bytes) = std::fs::read(root.join(&a.path)) else { return "(file not found)\n".into() };
     let text = String::from_utf8_lossy(&bytes);
-    let end = end.min(start + 120);
+    let end = a.end.min(a.start + 120);
     let mut out = String::new();
-    for (i, line) in text.lines().enumerate().skip(start.saturating_sub(1)).take(end + 1 - start.max(1)) {
+    for (i, line) in text.lines().enumerate().skip(a.start.saturating_sub(1)).take(end + 1 - a.start.max(1)) {
         let _ = writeln!(out, "{:>5}  {line}", i + 1);
+        for note in notes.iter().filter(|n| n.line == i + 1) {
+            let _ = writeln!(out, "       ^ note: {}", note.text);
+        }
     }
     out
 }

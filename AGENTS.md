@@ -13,15 +13,29 @@ in the background, plans the tour as a series of stops, and answers questions at
   - Every question is sent with the current stop as context.
   - Answers cite code as `[path:start-end]`, and the TUI turns these into links you can jump to.
   - Stops and answers come with 2–3 suggested follow-up questions you can pick with a key.
-- Agent backends:
-  - A: the `claude` CLI in headless stream-json mode (now)
-  - B: direct Anthropic API calls with our own read-only tools (later)
-  - The app only depends on `agent::Event`, so B replaces only the code that produces events.
+- Agents: the planner and guide run on a coding agent's CLI, read-only, in the toured folder. Picking
+  one is a background setting, not the point of the app: the start screen remembers the last choice.
+  - claude: `claude -p` in stream-json mode, one process per conversation (`agent/claude.rs`).
+  - codex: `codex app-server` over JSON-RPC, one thread per conversation, read-only sandbox. The
+    user's MCP servers and tool-adding features are switched off per session (`agent/codex.rs`).
+  - Gemini is left out for now: Gemini CLI no longer serves personal Google accounts.
+  - Programs are found on PATH the way a shell finds them, including npm's `.cmd` scripts.
+  - The app only depends on `agent::Event`, so a new agent only adds the code that produces events.
+  - Each folder has one tour per agent.
 - The planner and the guide are two separate agent sessions, so planning never blocks questions.
 - Simplicity first: no feature, crate or abstraction until it is needed. One crate for now.
 - Tour format: our own small JSON format (see `src/tour.rs`). CodeTour `.tour` export can be added later.
-- `engine.rs` owns planning and Q&A. The TUI (`app.rs`, `ui.rs`) and the MCP server (`mcp.rs`) are
-  both thin front-ends that feed it agent events.
+- `engine.rs` owns planning and Q&A. A background daemon (`daemon.rs`) hosts one engine per folder,
+  so the TUI (`app.rs`, `ui.rs`) and MCP servers (`mcp.rs`) share tours and see each other's
+  questions live. The first front-end that needs the daemon starts it; it runs from a copy of the
+  exe (so rebuilds are not blocked), saves tours to `%LOCALAPPDATA%\tourer` (or
+  `$XDG_STATE_HOME/tourer`), continues saved tours, and exits after 10 idle minutes. Front-ends
+  talk to it over localhost TCP with a token, one JSON message per line. A front-end built
+  differently from the running daemon starts a new one.
+- TUI: a start screen (continue the tour, plan a new one, guide, model), then the tour. Keys are
+  few and arrow-based, and the bottom bar shows the ones that work right now.
+- Line notes: the planner gives each stop notes on single lines, and the guide can add some after
+  `<<notes>>`. The code pane shows a note after its line if it fits, otherwise wrapped below it.
 - Formatting: a small line-based markdown renderer of our own (`markdown.rs`), so we control wrapping
   and link order. Syntax highlighting uses syntect with bat's "ansi" theme (via two-face), so colors
   come from the terminal palette and work on light and dark themes.
@@ -29,9 +43,15 @@ in the background, plans the tour as a series of stops, and answers questions at
   pulling in an async MCP SDK. Tools: `tour` (outline), `stop` (text plus code excerpts) and `ask`.
 
 ## Running
-- `cargo run -- <folder> [--model sonnet] [--out tour.json]` (needs `claude` on PATH and logged in).
-- Keys: `n`/`p` change stop, `j`/`k` scroll text, `Tab`/`Shift-Tab` cycle code links, `J`/`K` scroll code,
-  `Esc` back to the stop's code, `?` ask, `1`–`3` ask a suggested question, `q` quit.
-- MCP: `tourer --mcp [default-folder]`, e.g. `claude mcp add tourer -- /path/to/tourer --mcp`.
+- `cargo run -- <folder> [--agent claude|codex] [--model NAME] [--out tour.json] [--replan]` (needs
+  the agent's CLI on PATH and logged in). `--agent`, `--model` and `--replan` preselect the start
+  screen; the agent and model picked there are saved in `prefs.json` next to the tours.
+- Keys: `←`/`→` change stop, `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the focused pane, `Tab`
+  next pane, `Enter` (in the text) shows the next code reference, `Esc` back to the stop's code or
+  unzoom, `z` zoom, `?` ask, `1`–`3` ask a suggested question, `q` quit.
+- Mouse: click to focus, pick a stop or open a link; drag pane borders to resize; wheel scrolls.
+- Daemon log: `daemon.log` next to the saved tours.
+- MCP: `tourer --mcp [--agent codex] [default-folder]` (default agent: the last one picked), e.g. `claude mcp add tourer -- /path/to/tourer --mcp`.
   Tool calls take an optional `path`, and each folder's tour is planned once and shared.
-- `cargo test` covers markdown rendering and parsing of planner lines, answers and code references.
+- `cargo test` covers markdown rendering (tables, link positions), line notes in the code pane,
+  decoding codex events, and parsing of planner lines, answers and code references.

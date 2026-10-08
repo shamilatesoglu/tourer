@@ -1,18 +1,62 @@
-//! Agent sessions backed by the `claude` CLI in headless stream-json mode.
+//! Agent sessions: a coding agent's CLI running read-only in the toured folder.
+//! The rest of tourer only sees [`Event`]s, so each agent's protocol stays in its own module.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+mod claude;
+mod codex;
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::Sender;
-use std::thread;
 
-use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Role {
-    Planner,
-    Guide,
+/// The coding agents tourer can use as planner and guide.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Agent {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl Agent {
+    pub const ALL: [Agent; 2] = [Agent::Claude, Agent::Codex];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude",
+            Agent::Codex => "codex",
+        }
+    }
+
+    pub fn is_installed(self) -> bool {
+        self.program().is_some()
+    }
+
+    /// The agent's program, found on PATH the way a shell finds it. On Windows that includes
+    /// the `.cmd` scripts npm installs, which `Command` would skip for a later `.exe`.
+    fn program(self) -> Option<PathBuf> {
+        let extensions: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat"] } else { &[""] };
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|dir| {
+            extensions.iter().map(|ext| dir.join(format!("{}{ext}", self.name()))).find(|file| file.is_file())
+        })
+    }
+
+    /// A command that runs the agent's program.
+    fn command(self) -> Command {
+        Command::new(self.program().unwrap_or_else(|| self.name().into()))
+    }
+}
+
+impl fmt::Display for Agent {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 #[derive(Debug)]
@@ -27,115 +71,42 @@ pub enum Event {
     Exited(String),
 }
 
-pub struct Session {
-    child: Child,
-    stdin: ChildStdin,
-}
-
 pub struct Options<'a> {
     pub cwd: &'a Path,
     pub system_prompt: &'a str,
     pub model: Option<&'a str>,
 }
 
+pub enum Session {
+    Claude(claude::Session),
+    Codex(codex::Session),
+}
+
 impl Session {
-    pub fn spawn(role: Role, opts: &Options, tx: Sender<(Role, Event)>) -> Result<Self> {
-        let mut cmd = Command::new("claude");
-        cmd.current_dir(opts.cwd)
-            .args(["-p", "--verbose", "--include-partial-messages"])
-            .args(["--input-format", "stream-json", "--output-format", "stream-json"])
-            .args(["--tools", "Read,Grep,Glob", "--strict-mcp-config"])
-            .args(["--no-session-persistence", "--disable-slash-commands"])
-            .args(["--append-system-prompt", opts.system_prompt]);
-        if let Some(model) = opts.model {
-            cmd.args(["--model", model]);
-        }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to start `claude`; is Claude Code installed and on PATH?")?;
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
-
-        thread::spawn(move || {
-            let mut text_in_turn = false;
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                for event in decode(&v, &mut text_in_turn) {
-                    if tx.send((role, event)).is_err() {
-                        return;
-                    }
-                }
-            }
-            let mut err = String::new();
-            let _ = stderr.read_to_string(&mut err);
-            let tail = err.trim().chars().rev().take(300).collect::<Vec<_>>();
-            let _ = tx.send((role, Event::Exited(tail.into_iter().rev().collect())));
-        });
-
-        Ok(Session { child, stdin })
+    /// Starts a session. Its events are sent on `tx` together with `tag`.
+    pub fn spawn<T: Copy + Send + 'static>(
+        agent: Agent,
+        tag: T,
+        opts: &Options,
+        tx: Sender<(T, Event)>,
+    ) -> Result<Self> {
+        Ok(match agent {
+            Agent::Claude => Session::Claude(claude::Session::spawn(tag, opts, tx)?),
+            Agent::Codex => Session::Codex(codex::Session::spawn(tag, opts, tx)),
+        })
     }
 
+    /// Sends a user message, which starts a turn.
     pub fn send(&mut self, text: &str) -> Result<()> {
-        let msg = json!({"type": "user", "message": {"role": "user", "content": text}});
-        writeln!(self.stdin, "{msg}")?;
-        self.stdin.flush()?;
-        Ok(())
+        match self {
+            Session::Claude(s) => s.send(text),
+            Session::Codex(s) => s.send(text),
+        }
     }
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Turns one stream-json line into zero or more events. Subagent output is ignored.
-fn decode(v: &Value, text_in_turn: &mut bool) -> Vec<Event> {
-    if !v["parent_tool_use_id"].is_null() {
-        return vec![];
-    }
-    match v["type"].as_str() {
-        Some("stream_event") => {
-            let e = &v["event"];
-            match e["type"].as_str() {
-                // Separate text from consecutive assistant messages (around tool calls).
-                Some("message_start") if *text_in_turn => vec![Event::Text("\n\n".into())],
-                Some("content_block_delta") if e["delta"]["type"] == "text_delta" => {
-                    *text_in_turn = true;
-                    vec![Event::Text(e["delta"]["text"].as_str().unwrap_or("").into())]
-                }
-                _ => vec![],
-            }
-        }
-        Some("assistant") => v["message"]["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|c| c["type"] == "tool_use")
-            .map(|c| {
-                let input = &c["input"];
-                let target = ["file_path", "pattern", "path"]
-                    .iter()
-                    .find_map(|k| input[k].as_str())
-                    .unwrap_or("");
-                Event::Activity(format!("{} {}", c["name"].as_str().unwrap_or("?"), target))
-            })
-            .collect(),
-        Some("result") => {
-            *text_in_turn = false;
-            let done = if v["is_error"].as_bool().unwrap_or(false) {
-                let reason = v["result"].as_str().or(v["subtype"].as_str()).unwrap_or("error");
-                Err(reason.to_string())
-            } else {
-                Ok(())
-            };
-            vec![Event::TurnDone(done)]
-        }
-        _ => vec![],
-    }
+/// The last 300 characters of an agent's stderr.
+fn tail(stderr: &str) -> String {
+    let tail = stderr.trim().chars().rev().take(300).collect::<Vec<_>>();
+    tail.into_iter().rev().collect()
 }

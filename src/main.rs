@@ -1,20 +1,27 @@
 mod agent;
 mod app;
+mod daemon;
 mod engine;
 mod highlight;
 mod markdown;
 mod mcp;
+mod prefs;
 mod prompts;
 mod tour;
 mod ui;
 
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use ratatui::crossterm::execute;
+
+use crate::agent::Agent;
+use crate::prefs::Prefs;
 
 /// Guided, AI-planned tours of unfamiliar folders and codebases.
 #[derive(Parser)]
@@ -23,49 +30,85 @@ struct Args {
     /// Folder to tour. With --mcp, the default folder for tool calls.
     #[arg(default_value = ".")]
     path: PathBuf,
-    /// Model passed to the agent, e.g. "sonnet" or "opus".
+    /// The agent that plans and guides the tour. Defaults to the one picked last time.
+    #[arg(long)]
+    agent: Option<Agent>,
+    /// Model passed to the agent, e.g. "sonnet" for claude.
     #[arg(long)]
     model: Option<String>,
     /// Write the tour, including questions and answers, as JSON when quitting.
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Throw away the folder's saved tour and plan a new one.
+    #[arg(long)]
+    replan: bool,
     /// Serve tours to other agents over MCP (stdio) instead of opening the TUI.
     #[arg(long)]
     mcp: bool,
+    /// Run as the background daemon that owns all tours. Started automatically.
+    #[arg(long, hide = true)]
+    daemon: bool,
+    /// The build of tourer that started the daemon.
+    #[arg(long, hide = true, default_value = "")]
+    build: String,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.daemon {
+        return daemon::run(args.build);
+    }
     let root = args.path.canonicalize().with_context(|| format!("cannot open {}", args.path.display()))?;
     if args.mcp {
-        return mcp::serve(root, args.model);
+        let prefs = Prefs::load();
+        let agent = args.agent.unwrap_or(prefs.agent);
+        let model = args.model.or_else(|| prefs.model(agent).map(str::to_string));
+        return mcp::serve(root, agent, model);
     }
 
+    let (client, replies) = daemon::connect()?;
     let (tx, rx) = mpsc::channel();
-    let engine = engine::Engine::new(root.clone(), args.model, tx)?;
-    let mut app = app::App::new(engine, root);
+    thread::spawn(move || {
+        for reply in replies {
+            if tx.send(reply).is_err() {
+                return;
+            }
+        }
+    });
+    let mut app = app::App::new(client, root, args.agent, args.model, args.replan);
 
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
+        execute!(std::io::stdout(), EnableMouseCapture)?;
         while !app.quit {
             terminal.draw(|f| ui::draw(f, &mut app))?;
-            if event::poll(Duration::from_millis(50))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                app.on_key(key);
+            if event::poll(Duration::from_millis(50))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Event::Mouse(mouse) => app.on_mouse(mouse),
+                    _ => {}
+                }
             }
-            while let Ok((role, ev)) = rx.try_recv() {
-                app.on_agent(role, ev);
+            loop {
+                match rx.try_recv() {
+                    Ok(reply) => app.on_reply(reply),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        app.error = Some("lost the connection to the tourer daemon".into());
+                        break;
+                    }
+                }
             }
         }
         Ok(())
     })();
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
 
-    if let Some(out) = args.out {
-        std::fs::write(&out, serde_json::to_string_pretty(&app.engine.tour)?)
-            .with_context(|| format!("cannot write {}", out.display()))?;
+    if let Some(out) = args.out
+        && let Some(json) = app.tour_json()
+    {
+        std::fs::write(&out, json).with_context(|| format!("cannot write {}", out.display()))?;
     }
     result
 }
