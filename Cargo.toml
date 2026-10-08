@@ -1,0 +1,19 @@
+[package]
+name = "tourer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+ratatui = "0.30.2"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+textwrap = "0.16.4"
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-default-fancy"] }
+
+# Syntax highlighting is slow unoptimized; optimize dependencies even in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
