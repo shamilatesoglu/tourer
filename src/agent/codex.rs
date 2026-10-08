@@ -12,14 +12,14 @@ use std::thread;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::{Agent, Event, Options, tail};
+use super::{Agent, Event, Memory, Options, Usage, tail};
 
 /// Codex features that give the agent tools beyond reading the folder. Unknown names are
 /// ignored when set through config, so this list is safe across Codex versions.
 const FEATURES_OFF: [&str; 8] =
     ["apps", "plugins", "browser_use", "computer_use", "image_generation", "multi_agent", "hooks", "goals"];
 
-/// The id of our `thread/start` request; turns use ids after it.
+/// The id of our `thread/start` or `thread/resume` request; turns use ids after it.
 const THREAD_START: u64 = 2;
 
 pub struct Session {
@@ -39,6 +39,14 @@ struct Setup {
     cwd: PathBuf,
     system_prompt: String,
     model: Option<String>,
+    thread: Thread,
+}
+
+/// The conversation to open: [`Memory`] with an owned id.
+enum Thread {
+    Throwaway,
+    Kept,
+    Resume(String),
 }
 
 impl Session {
@@ -49,6 +57,11 @@ impl Session {
             cwd: opts.cwd.to_path_buf(),
             system_prompt: opts.system_prompt.to_string(),
             model: opts.model.map(str::to_string),
+            thread: match opts.memory {
+                Memory::None => Thread::Throwaway,
+                Memory::Keep => Thread::Kept,
+                Memory::Resume(id) => Thread::Resume(id.to_string()),
+            },
         };
         let shared = process.clone();
         thread::spawn(move || {
@@ -110,26 +123,40 @@ fn run<T: Copy + Send + 'static>(
 
     let (thread_tx, thread_rx) = mpsc::channel();
     let replies = stdin.clone();
+    let tx_session = tx.clone();
     thread::spawn(move || read(tag, stdout, stderr, &replies, &tx, thread_tx));
 
     write(&stdin, json!({"id": 1, "method": "initialize", "params": {"clientInfo": {
         "name": "tourer", "version": env!("CARGO_PKG_VERSION"),
     }}}))?;
     write(&stdin, json!({"method": "initialized"}))?;
-    write(&stdin, json!({"id": THREAD_START, "method": "thread/start", "params": {
+    let mut params = json!({
         "cwd": setup.cwd,
         "sandbox": "read-only",
         "approvalPolicy": "never",
-        "ephemeral": true,
         "developerInstructions": setup.system_prompt,
         "model": setup.model,
-    }}))?;
+    });
+    let method = match &setup.thread {
+        Thread::Throwaway | Thread::Kept => {
+            params["ephemeral"] = json!(matches!(setup.thread, Thread::Throwaway));
+            "thread/start"
+        }
+        Thread::Resume(id) => {
+            params["threadId"] = json!(id);
+            "thread/resume"
+        }
+    };
+    write(&stdin, json!({"id": THREAD_START, "method": method, "params": params}))?;
     let thread = match thread_rx.recv() {
         Ok(Ok(thread)) => thread,
         Ok(Err(err)) => bail!("codex could not start a conversation: {err}"),
         // The process ended; the reader reports it.
         Err(_) => return Ok(()),
     };
+    if !matches!(setup.thread, Thread::Throwaway) {
+        let _ = tx_session.send((tag, Event::Session(thread.clone())));
+    }
     for (id, text) in (THREAD_START + 1..).zip(messages) {
         write(&stdin, json!({"id": id, "method": "turn/start", "params": {
             "threadId": thread,
@@ -244,6 +271,17 @@ impl Decoder {
             }
             ("item/started", Some("webSearch")) => {
                 vec![Event::Activity(format!("Search the web {}", item["query"].as_str().unwrap_or("")))]
+            }
+            // Each report gives the tokens of the model call that just ended.
+            ("thread/tokenUsage/updated", _) => {
+                let last = &params["tokenUsage"]["last"];
+                let count = |key: &str| last[key].as_u64().unwrap_or(0);
+                let usage = Usage {
+                    input: count("inputTokens"),
+                    cached: count("cachedInputTokens"),
+                    output: count("outputTokens"),
+                };
+                vec![Event::Usage(usage)]
             }
             ("turn/completed", _) => {
                 self.text_in_turn = false;

@@ -9,6 +9,7 @@ mod prefs;
 mod prompts;
 mod tour;
 mod ui;
+mod view;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
@@ -82,7 +83,9 @@ fn main() -> Result<()> {
         execute!(std::io::stdout(), EnableMouseCapture)?;
         while !app.quit {
             terminal.draw(|f| ui::draw(f, &mut app))?;
-            if event::poll(Duration::from_millis(50))? {
+            app.report_seen();
+            let wait = if app.is_animating() { 16 } else { 50 };
+            if event::poll(Duration::from_millis(wait))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
                     Event::Mouse(mouse) => app.on_mouse(mouse),

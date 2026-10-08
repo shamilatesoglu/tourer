@@ -69,12 +69,53 @@ pub enum Event {
     TurnDone(Result<(), String>),
     /// The process ended; carries the tail of stderr.
     Exited(String),
+    /// The agent's id for a kept conversation, to continue it later with [`Memory::Resume`].
+    Session(String),
+    /// Tokens used since the last report.
+    Usage(Usage),
+}
+
+/// Token counts. `input` includes the `cached` part.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input: u64,
+    pub cached: u64,
+    pub output: u64,
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, other: Usage) {
+        self.input += other.input;
+        self.cached += other.cached;
+        self.output += other.output;
+    }
+}
+
+impl fmt::Display for Usage {
+    /// "12.3k in (87% cached), 1.2k out".
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let short = |n: u64| if n < 1000 { n.to_string() } else { format!("{:.1}k", n as f64 / 1000.0) };
+        let percent = (self.cached * 100).checked_div(self.input).unwrap_or(0);
+        write!(f, "{} in ({percent}% cached), {} out", short(self.input), short(self.output))
+    }
+}
+
+/// Whether the agent keeps the conversation so it can be continued after a restart.
+#[derive(Debug, Clone, Copy)]
+pub enum Memory<'a> {
+    /// Thrown away when the session ends.
+    None,
+    /// Kept; its id arrives as [`Event::Session`].
+    Keep,
+    /// Continues the kept conversation with this id.
+    Resume(&'a str),
 }
 
 pub struct Options<'a> {
     pub cwd: &'a Path,
     pub system_prompt: &'a str,
     pub model: Option<&'a str>,
+    pub memory: Memory<'a>,
 }
 
 pub enum Session {

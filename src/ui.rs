@@ -1,33 +1,30 @@
+//! Drawing: the start screen, and the tour screen with its popups. Drawing also records where
+//! things landed on screen, which input handling in `view.rs` uses.
+
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use textwrap::core::display_width;
 
 use crate::agent::Agent;
-use crate::app::{App, Areas, Pane, Row, Screen, Start, TourView};
+use crate::app::{App, Row, Screen, Start};
 use crate::engine::AnswerState;
 use crate::highlight::StyledLine;
 use crate::markdown::Renderer;
-use crate::tour::{self, Anchor, Note};
+use crate::tour::{self, Note, Stop};
+use crate::view::{Areas, Doc, Item, Pane, Popup, Shown, Target, TourView};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(f.area());
     let root = shown_path(&app.root);
     match &mut app.screen {
         Screen::Start(start) => draw_start(f, start, &root, main),
-        Screen::Tour(view) => {
-            view.areas = layout(view, main);
-            let Areas { stops, code, text, .. } = view.areas;
-            draw_stops(f, view, stops);
-            // The narrative decides the links, and the code pane may show one of them. Hidden
-            // panes have empty areas but are still laid out, so the links stay current.
-            draw_text(f, view, text);
-            draw_code(f, view, code);
-        }
+        Screen::Tour(view) => draw_tour(f, view, main),
     }
     draw_status(f, app, status);
 }
@@ -120,207 +117,539 @@ fn draw_start(f: &mut Frame, start: &mut Start, root: &str, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The stop list on the left, code above the narrative on the right; or one zoomed pane.
-fn layout(view: &TourView, main: Rect) -> Areas {
-    let mut areas = Areas { main, ..Default::default() };
-    if view.zoomed {
-        match view.focus {
-            Pane::Stops => areas.stops = main,
-            Pane::Code => areas.code = main,
-            Pane::Text => areas.text = main,
+/// The tour: a progress line, the document of stops, and the code beside it (or in a popup when
+/// the screen is narrow). Also fills in the layout that input handling uses.
+fn draw_tour(f: &mut Frame, view: &mut TourView, area: Rect) {
+    let [progress, main] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+    view.wide = main.width >= 100;
+    if !view.wide {
+        view.zoomed = false;
+        if view.focus == Pane::Code && !matches!(view.popup, Some(Popup::Code)) {
+            view.focus = Pane::Text;
         }
-        return areas;
     }
-    let width = view.stops_width.min(main.width.saturating_sub(20));
-    let [stops, right] = Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)]).areas(main);
-    let [code, text] =
-        Layout::vertical([Constraint::Percentage(view.code_percent), Constraint::Fill(1)]).areas(right);
-    Areas { main, stops, code, text }
-}
-
-/// A pane's border, highlighted when the pane has focus.
-fn block(view: &TourView, pane: Pane) -> Block<'static> {
-    let block = Block::bordered();
-    if view.focus == pane { block.border_style(Style::new().fg(Color::Cyan)) } else { block }
-}
-
-fn draw_stops(f: &mut Frame, view: &TourView, area: Rect) {
-    let tour = &view.state.tour;
-    let title = if tour.title.is_empty() { "tourer" } else { &tour.title };
-    let room = (area.width as usize).saturating_sub(9);
-    let mut lines: Vec<Line> = tour
-        .stops
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let marker = if i == view.sel { "▶" } else { " " };
-            let asked = if s.thread.is_empty() { "" } else { " ·" };
-            let title = if s.title.chars().count() > room {
-                format!("{}…", s.title.chars().take(room.saturating_sub(1)).collect::<String>())
-            } else {
-                s.title.clone()
-            };
-            let line = Line::from(format!("{marker} {:>2} {title}{asked}", i + 1));
-            if i == view.sel { line.bold().cyan() } else { line }
-        })
-        .collect();
-    if view.state.planning {
-        lines.push(Line::from(""));
-        lines.push(Line::from(format!("  … planning: {}", view.state.planner_activity)).dim());
-    }
-    f.render_widget(Paragraph::new(lines).block(block(view, Pane::Stops).title(title.to_string())), area);
-}
-
-fn draw_code(f: &mut Frame, view: &mut TourView, area: Rect) {
-    let Some(target) = view.code_target() else {
-        let summary = &view.state.tour.summary;
-        let msg = if summary.is_empty() { "Exploring the folder…" } else { summary };
-        let p = Paragraph::new(msg.to_string()).wrap(Wrap { trim: true });
-        f.render_widget(p.block(block(view, Pane::Code)), area);
-        return;
-    };
-    let block = block(view, Pane::Code).title(format!("{}:{}-{}", target.path, target.start, target.end));
-    let height = area.height.saturating_sub(2) as usize;
-    let width = area.width.saturating_sub(2) as usize;
-    let notes: Vec<Note> = match view.state.tour.stops.get(view.sel) {
-        Some(stop) => stop.notes_in(&target.path).into_iter().cloned().collect(),
-        None => vec![],
-    };
-    if let Some(file) = view.file(&target.path) {
-        let last_page = file.len().saturating_sub(height);
-        view.code_scroll = view.code_scroll.min(last_page);
-    }
-    let scroll = view.code_scroll;
-    let lines = match view.file(&target.path) {
-        None => vec![Line::from("(file not found)").dim()],
-        Some(file) => code_lines(file, &target, &notes, scroll, height, width),
-    };
-    f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// Numbered code lines from `scroll` on, with the anchored range marked in the gutter.
-/// A note that fits after its line goes there; longer ones wrap onto lines below it.
-fn code_lines(
-    file: &[StyledLine],
-    target: &Anchor,
-    notes: &[Note],
-    scroll: usize,
-    height: usize,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let digits = file.len().to_string().len();
-    let note_style = Style::new().fg(Color::Green).add_modifier(Modifier::ITALIC);
-    let mut out = vec![];
-    for (i, spans) in file.iter().enumerate().skip(scroll) {
-        if out.len() >= height {
-            break;
+    let empty = Rect::new(main.x, main.y, 0, 0);
+    let (text_area, code_area) = match (view.wide, view.zoomed, view.focus) {
+        (false, ..) => (main, empty),
+        (true, true, Pane::Text) => (main, empty),
+        (true, true, Pane::Code) => (empty, main),
+        (true, false, _) => {
+            let [t, c] = Layout::horizontal([Constraint::Percentage(view.text_percent), Constraint::Fill(1)]).areas(main);
+            (t, c)
         }
-        let n = i + 1;
-        let (number, gutter) = if (target.start..=target.end).contains(&n) {
-            (Span::from(format!("{n:>digits$}")).bold(), Span::from("▌").cyan())
-        } else {
-            (Span::from(format!("{n:>digits$}")).dark_gray(), Span::from(" "))
-        };
-        let code: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        let mut used = digits + 1 + display_width(&code);
-        let mut line = vec![number, gutter];
-        line.extend(spans.iter().cloned());
-        let mut below = vec![];
-        for note in notes.iter().filter(|note| note.line == n) {
-            let hint = format!("  ◂ {}", note.text);
-            if below.is_empty() && used + display_width(&hint) <= width {
-                used += display_width(&hint);
-                line.push(Span::styled(hint, note_style));
-                continue;
-            }
-            // Under the code it describes, aligned with the line's indentation.
-            let indent = (code.len() - code.trim_start().len()).min(width / 2);
-            let pad = " ".repeat(digits + 1 + indent);
-            let room = width.saturating_sub(pad.len() + 2).max(10);
-            for (k, part) in textwrap::wrap(&note.text, room).into_iter().enumerate() {
-                let mark = if k == 0 { "╰ " } else { "  " };
-                below.push(Line::from(vec![Span::raw(pad.clone()), Span::styled(format!("{mark}{part}"), note_style)]));
-            }
-        }
-        out.push(Line::from(line));
-        out.extend(below);
+    };
+    view.areas = Areas { text: text_area, code: code_area, ..Default::default() };
+
+    // The document is laid out even when zoomed away, so links and the current stop stay right.
+    let laid_out = if text_area.width > 0 { text_area } else { main };
+    let width = laid_out.width.saturating_sub(2) as usize;
+    let height = laid_out.height.saturating_sub(2) as usize;
+    let (lines, doc, spots) = document(view, width, height);
+    view.doc = doc;
+    // A jump to a stop aims at where the stop is now, and the stop stays current until it lands.
+    if let Some(i) = view.jump
+        && let Some(&line) = view.doc.stop_lines.get(i)
+    {
+        view.text.to(line);
     }
-    out.truncate(height);
-    out
+    scroll_text(view, height);
+    match view.jump {
+        Some(_) if view.text.is_moving() => {}
+        _ => {
+            view.jump = None;
+            view.current = view.doc.stop_lines.iter().rposition(|&l| l <= view.text.top() + 1).unwrap_or(0);
+        }
+    }
+
+    if text_area.width > 0 {
+        draw_text(f, view, lines, spots, text_area);
+    }
+    draw_progress(f, view, progress);
+    if code_area.width > 0 {
+        draw_code(f, view, code_area);
+    }
+    match view.popup {
+        Some(Popup::Code) => {
+            let area = main.inner(Margin::new(1, 1));
+            f.render_widget(Clear, area);
+            view.areas.code = area;
+            draw_code(f, view, area);
+        }
+        Some(Popup::Outline { .. }) => draw_outline(f, view, main),
+        Some(Popup::Files { .. }) => draw_files(f, view, main),
+        None => {}
+    }
+    if view.areas.code.width > 0 {
+        draw_note_popup(f, view);
+    }
+    let visible = seen_candidates(view);
+    view.track_seen(visible);
 }
 
-fn draw_text(f: &mut Frame, view: &mut TourView, area: Rect) {
-    let width = area.width.saturating_sub(2) as usize;
-    let height = area.height.saturating_sub(2) as usize;
+/// Scrolls the text toward its target, keeping in view what must be: the question being typed
+/// and the answer being followed.
+fn scroll_text(view: &mut TourView, height: usize) {
+    let keep = view.doc.input_line.or_else(|| view.follow.and_then(|s| view.doc.thread_ends.get(s).copied()));
+    if let Some(line) = keep {
+        let bottom = view.text.target() + height;
+        if line + 2 > bottom {
+            view.text.to(line + 2 - height.min(line + 2));
+        }
+    }
+    view.text.limit(view.doc.len.saturating_sub(height));
+    view.text.step();
+}
+
+/// A clickable spot in the document: a line, columns of it, and what it does.
+struct DocSpot {
+    line: usize,
+    cols: std::ops::Range<usize>,
+    target: Target,
+}
+
+/// The whole tour as one document: each stop with its code references, text, questions and
+/// answers; the current stop's suggestions and the question being typed.
+fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'static>>, Doc, Vec<DocSpot>) {
+    // Code excerpts go inline when there is no room for the code pane beside the text.
+    let excerpts: Vec<Vec<Line<'static>>> = if view.wide {
+        vec![]
+    } else {
+        let stops = view.state.tour.stops.clone();
+        stops.iter().map(|stop| excerpt_lines(view, stop, width)).collect()
+    };
+    let shown = match &view.code.shown {
+        Shown::Ref(a) => Some(a.clone()),
+        _ => None,
+    };
+    let selected = shown.and_then(|a| view.doc.links.iter().position(|l| *l == a));
+    if let Some(i) = view.jump {
+        view.current = i;
+    }
     let state = &view.state;
-    let mut r = Renderer::new(width, &view.hl, view.link);
-    if let Some(stop) = state.tour.stops.get(view.sel) {
-        r.text(&format!("{}. {}", view.sel + 1, stop.title), Style::new().bold(), "", "");
-        for a in &stop.anchors {
-            r.text(&a.to_string(), Style::new(), "", "");
+    let current = view.current;
+    let mut r = Renderer::new(width, &view.hl, selected);
+    let mut doc = Doc { height, ..Default::default() };
+    let mut spots = vec![];
+    let unseen = Span::from(" ✦").yellow().bold();
+
+    if !state.tour.title.is_empty() {
+        r.lines.push(Line::from(state.tour.title.clone()).bold());
+        if !state.tour.summary.is_empty() {
+            r.text(&state.tour.summary, Style::new().dim(), "", "");
+        }
+    }
+    for (i, stop) in state.tour.stops.iter().enumerate() {
+        doc.stop_lines.push(r.lines.len());
+        let start = r.lines.len();
+        r.lines.push(Line::from("─".repeat(width)).dim());
+        let mut header = vec![Span::from(format!("{} ", i + 1)).cyan().bold(), Span::from(stop.title.clone()).bold()];
+        if stop.freshness.has_unseen_update() {
+            header.push(unseen.clone());
+        }
+        r.lines.push(Line::from(header));
+        let anchors: Vec<String> = stop.anchors.iter().map(|a| a.to_string()).collect();
+        if !anchors.is_empty() {
+            r.text(&anchors.join(" "), Style::new(), "", "");
         }
         r.blank();
         r.markdown(&stop.body, "");
-        for (i, ex) in stop.thread.iter().enumerate() {
+        if let Some(lines) = excerpts.get(i) {
+            r.lines.extend(lines.iter().cloned());
+        }
+        doc.items.push((start..r.lines.len(), Item::Stop(i)));
+
+        for (e, ex) in stop.thread.iter().enumerate() {
+            let start = r.lines.len();
             r.blank();
-            r.text(&ex.q, Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD), "› ", "  ");
+            let about = ex.code.as_ref().map(|a| format!("{a} ")).unwrap_or_default();
+            let style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            r.text(&format!("{about}{}", ex.q), style, "› ", "  ");
+            if ex.freshness.has_unseen_update()
+                && let Some(last) = r.lines.last_mut()
+            {
+                last.spans.push(unseen.clone());
+            }
             let answer = tour::split_answer(&ex.a).text;
-            let answer_state = state.answer_state((view.sel, i));
             if !answer.is_empty() {
                 r.markdown(answer, "  ");
             }
-            match answer_state {
+            match state.answer_state((i, e)) {
                 AnswerState::Queued => r.text("… queued", Style::new().dim(), "  ", "  "),
-                AnswerState::Answering => {
-                    r.text(&format!("… {}", state.guide_activity), Style::new().dim(), "  ", "  ")
-                }
+                AnswerState::Answering => r.text(&format!("… {}", state.guide_activity), Style::new().dim(), "  ", "  "),
                 AnswerState::Done => {}
             }
+            doc.items.push((start..r.lines.len(), Item::Answer(i, e)));
         }
+        doc.thread_ends.push(r.lines.len());
+
+        // Every stop shows its suggestions, so the layout does not shift as the current stop
+        // changes; the current stop's stand out, and only they have number keys.
         let suggestions = stop.suggestions();
         if !suggestions.is_empty() {
             r.blank();
         }
-        for (i, s) in suggestions.iter().enumerate() {
-            r.text(s, Style::new().fg(Color::Yellow), &format!("{} › ", i + 1), "    ");
+        for (k, s) in suggestions.iter().enumerate() {
+            let from = r.lines.len();
+            let (style, marker) = if i == current {
+                (Style::new().fg(Color::Yellow), format!("{} › ", k + 1))
+            } else {
+                (Style::new().dim(), "  › ".to_string())
+            };
+            r.text(s, style, &marker, "    ");
+            for line in from..r.lines.len() {
+                spots.push(DocSpot { line, cols: 0..width, target: Target::Suggestion(i, s.clone()) });
+            }
+        }
+        if let Some(input) = view.input.as_ref().filter(|input| input.stop == i) {
+            r.blank();
+            doc.input_line = Some(r.lines.len());
+            let about = input.code.as_ref().map(|a| format!("{a} ")).unwrap_or_default();
+            r.text(&format!("{about}{}▏", input.text), Style::new().fg(Color::Cyan), "› ", "  ");
+        }
+        r.blank();
+    }
+    if state.planning {
+        let activity = if state.tour.stops.is_empty() { "exploring the folder" } else { "planning more stops" };
+        r.text(&format!("… {activity}: {}", state.planner_activity), Style::new().dim(), "", "");
+    }
+    // Room to scroll the last stop to the top, so jumping to it works like jumping to any other.
+    for _ in 0..height * 2 / 3 {
+        r.blank();
+    }
+
+    for s in &r.spots {
+        spots.push(DocSpot { line: s.line, cols: s.cols.clone(), target: Target::Link(s.link) });
+        if doc.link_lines.len() == s.link {
+            doc.link_lines.push(s.line);
         }
     }
-    let (lines, links, spots) = (r.lines, r.links, r.spots);
-    view.links = links;
-    let max = lines.len().saturating_sub(height);
-    if view.follow {
-        view.text_scroll = max;
-    }
-    view.text_scroll = view.text_scroll.min(max);
-    let visible = view.text_scroll..view.text_scroll + height;
-    view.link_spots = spots
-        .into_iter()
-        .filter(|s| visible.contains(&s.line))
-        .map(|s| {
-            let x = area.x + 1 + s.cols.start as u16;
-            let y = area.y + 1 + (s.line - view.text_scroll) as u16;
-            (Rect::new(x, y, s.cols.len() as u16, 1), s.link)
-        })
-        .collect();
-    let p = Paragraph::new(lines).scroll((view.text_scroll as u16, 0));
-    f.render_widget(p.block(block(view, Pane::Text)), area);
+    doc.links = r.links;
+    doc.len = r.lines.len();
+    (r.lines, doc, spots)
 }
 
-/// The bottom line: the question being typed, an error, or the keys that work right now.
+/// A stop's code, for showing inline under its text: the start of each anchor.
+fn excerpt_lines(view: &mut TourView, stop: &Stop, width: usize) -> Vec<Line<'static>> {
+    const MAX_LINES: usize = 15;
+    let mut out = vec![];
+    for a in &stop.anchors {
+        let notes: Vec<Note> = stop.notes_in(&a.path).into_iter().cloned().collect();
+        let Some(file) = view.file(&a.path) else { continue };
+        out.push(Line::default());
+        out.push(Line::from(a.to_string()).dim());
+        let lines = (a.end + 1).saturating_sub(a.start);
+        let marks = Marks { range: Some((a.start, a.end)), ..Default::default() };
+        out.extend(code_lines(file, &notes, a.start.saturating_sub(1), lines.min(MAX_LINES), width, marks));
+        if lines > MAX_LINES {
+            let more = format!("  … {} more; Enter on the reference opens it", count(lines - MAX_LINES, "line"));
+            out.push(Line::from(more).dim());
+        }
+    }
+    out
+}
+
+fn draw_text(f: &mut Frame, view: &mut TourView, lines: Vec<Line<'static>>, spots: Vec<DocSpot>, area: Rect) {
+    let top = view.text.top();
+    let height = area.height.saturating_sub(2) as usize;
+    for s in spots.into_iter().filter(|s| (top..top + height).contains(&s.line)) {
+        let x = area.x + 1 + s.cols.start as u16;
+        let y = area.y + 1 + (s.line - top) as u16;
+        let width = (s.cols.len() as u16).min(area.right().saturating_sub(x + 1));
+        view.areas.spots.push((Rect::new(x, y, width, 1), s.target));
+    }
+    let shown: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
+    f.render_widget(Paragraph::new(shown).block(pane_block(view, Pane::Text)), area);
+}
+
+/// A pane's border, highlighted when the pane has focus.
+fn pane_block(view: &TourView, pane: Pane) -> Block<'static> {
+    let block = Block::bordered();
+    if view.focus == pane && view.wide { block.border_style(Style::new().fg(Color::Cyan)) } else { block }
+}
+
+/// One mark per stop, the current one's title, and where the tour is.
+fn draw_progress(f: &mut Frame, view: &mut TourView, area: Rect) {
+    let stops = &view.state.tour.stops;
+    let mut spans = vec![Span::from(" ")];
+    let mut x = area.x + 1;
+    for (i, stop) in stops.iter().enumerate() {
+        let mark = if stop.has_unseen_update() {
+            Span::from("✦").yellow().bold()
+        } else if i == view.current {
+            Span::from("◉").cyan().bold()
+        } else if stop.freshness.is_visited() {
+            Span::from("●")
+        } else {
+            Span::from("○").dim()
+        };
+        if x + 2 > area.right().saturating_sub(20) {
+            spans.push(Span::from("…").dim());
+            break;
+        }
+        view.areas.spots.push((Rect::new(x, area.y, 1, 1), Target::Stop(i)));
+        spans.push(mark);
+        spans.push(Span::from(" "));
+        x += 2;
+    }
+    if let Some(stop) = stops.get(view.current) {
+        spans.push(Span::from(format!("  {}/{} ", view.current + 1, stops.len())).dim());
+        spans.push(Span::from(stop.title.clone()).bold());
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_code(f: &mut Frame, view: &mut TourView, area: Rect) {
+    let target = view.code_target();
+    if target != view.code.last {
+        if let Some(t) = &target {
+            let (start, end) = t.range.unwrap_or((1, 1));
+            view.code.scroll.to(start.saturating_sub(4));
+            view.code.cursor = start;
+            view.code.mark = None;
+            view.code.flash = t.range.map(|_| Instant::now());
+            // Long ranges start at the top; short ones get some code above them for context.
+            if end - start > area.height as usize {
+                view.code.scroll.to(start.saturating_sub(1));
+            }
+        }
+        view.code.last = target.clone();
+    }
+    let Some(target) = target else {
+        let summary = &view.state.tour.summary;
+        let msg = if summary.is_empty() { "Exploring the folder…" } else { summary };
+        let p = Paragraph::new(msg.to_string()).wrap(Wrap { trim: true });
+        f.render_widget(p.block(pane_block(view, Pane::Code)), area);
+        return;
+    };
+    let title = match target.range {
+        Some((start, end)) => format!("{}:{start}-{end}", target.path),
+        None => target.path.clone(),
+    };
+    let height = area.height.saturating_sub(2) as usize;
+    let width = area.width.saturating_sub(2) as usize;
+    let notes: Vec<Note> = match view.state.tour.stops.get(view.current) {
+        Some(stop) => stop.notes_in(&target.path).into_iter().cloned().collect(),
+        None => vec![],
+    };
+    view.code.height = height;
+    view.code.lines = view.file(&target.path).map_or(0, |f| f.len());
+    view.code.scroll.limit(view.code.lines.saturating_sub(height));
+    view.code.scroll.step();
+    let focused = view.focus == Pane::Code;
+    let marks = Marks {
+        range: target.range,
+        cursor: focused.then_some(view.code.cursor),
+        selection: view.code.mark.map(|_| view.code.selection()),
+        flash: view.code.flash.is_some_and(|t| t.elapsed() < Duration::from_millis(700)),
+    };
+    let top = view.code.scroll.top();
+    let block = pane_block(view, Pane::Code).title(title);
+    let lines = match view.file(&target.path) {
+        None => vec![Line::from("(file not found)").dim()],
+        Some(file) => code_lines(file, &notes, top, height, width, marks),
+    };
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// What to point out in the code: the cited lines, the cursor and the selection.
+#[derive(Debug, Default, Clone, Copy)]
+struct Marks {
+    range: Option<(usize, usize)>,
+    cursor: Option<usize>,
+    selection: Option<(usize, usize)>,
+    /// The cited lines just changed; show them brighter for a moment.
+    flash: bool,
+}
+
+/// Numbered code lines from `scroll` on. Notes go after their line, cut to fit; the full text
+/// shows in a popup.
+fn code_lines(
+    file: &[StyledLine],
+    notes: &[Note],
+    scroll: usize,
+    height: usize,
+    width: usize,
+    marks: Marks,
+) -> Vec<Line<'static>> {
+    let digits = file.len().to_string().len();
+    let note_style = Style::new().fg(Color::Green).add_modifier(Modifier::ITALIC);
+    let within = |r: Option<(usize, usize)>, n: usize| r.is_some_and(|(a, b)| (a..=b).contains(&n));
+    let mut out = vec![];
+    for (i, spans) in file.iter().enumerate().skip(scroll).take(height) {
+        let n = i + 1;
+        let mut number = Span::from(format!("{n:>digits$}"));
+        number = if within(marks.range, n) { number.bold() } else { number.dark_gray() };
+        if marks.flash && within(marks.range, n) {
+            number = number.cyan().reversed();
+        }
+        if marks.cursor == Some(n) {
+            number = number.reversed();
+        }
+        let gutter = if within(marks.selection, n) {
+            Span::from("┃").yellow().bold()
+        } else if within(marks.range, n) {
+            Span::from("▌").cyan()
+        } else {
+            Span::from(" ")
+        };
+        let code: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        let used = digits + 1 + display_width(&code);
+        let mut line = vec![number, gutter];
+        line.extend(spans.iter().cloned());
+        let said: Vec<&str> = notes.iter().filter(|note| note.line == n).map(|note| note.text.as_str()).collect();
+        if !said.is_empty() {
+            let room = width.saturating_sub(used + 4);
+            let text = said.join(" · ");
+            let hint = if room < 6 {
+                " ◂".to_string()
+            } else if display_width(&text) <= room {
+                format!("  ◂ {text}")
+            } else {
+                let cut: String = text.chars().take(room.saturating_sub(1)).collect();
+                format!("  ◂ {}…", cut.trim_end())
+            };
+            line.push(Span::styled(hint, note_style));
+        }
+        out.push(Line::from(line));
+    }
+    out
+}
+
+/// The full notes on the line under the mouse, or under the cursor in the focused code pane.
+fn draw_note_popup(f: &mut Frame, view: &mut TourView) {
+    let area = view.areas.code;
+    let hovered = view.hover.filter(|p| area.contains(*p)).and_then(|p| view.code_line_at(p.y));
+    let line = hovered.or((view.focus == Pane::Code).then_some(view.code.cursor));
+    let (Some(line), Some(target)) = (line, view.code.last.as_ref()) else { return };
+    let Some(stop) = view.state.tour.stops.get(view.current) else { return };
+    let notes: Vec<String> = stop.notes_in(&target.path).iter().filter(|n| n.line == line).map(|n| n.text.clone()).collect();
+    let top = view.code.scroll.top();
+    if notes.is_empty() || line <= top || line > top + view.code.height {
+        return;
+    }
+    let width = area.width.saturating_sub(8).min(64);
+    let text: Vec<Line> = notes
+        .iter()
+        .flat_map(|n| textwrap::wrap(n, width.saturating_sub(4) as usize))
+        .map(|l| Line::from(l.into_owned()))
+        .collect();
+    let height = text.len() as u16 + 2;
+    let row = area.y + 1 + (line - 1 - top) as u16;
+    let y = if row + 1 + height <= area.bottom() { row + 1 } else { row.saturating_sub(height) };
+    let popup = Rect::new(area.x + 6, y, width, height).intersection(f.area());
+    f.render_widget(Clear, popup);
+    let block = Block::bordered().border_style(Style::new().fg(Color::Green)).title(format!(" note · line {line} "));
+    f.render_widget(Paragraph::new(text).block(block), popup);
+}
+
+/// A box in the middle of `area`.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(4));
+    let height = height.min(area.height.saturating_sub(2));
+    Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 3, width, height)
+}
+
+/// The list of stops, to jump to one, with what the agents have used so far.
+fn draw_outline(f: &mut Frame, view: &mut TourView, area: Rect) {
+    let Some(Popup::Outline { sel }) = view.popup else { return };
+    let stops = &view.state.tour.stops;
+    let popup = centered(area, 76, stops.len() as u16 + 5);
+    f.render_widget(Clear, popup);
+    let inner = popup.inner(Margin::new(1, 1));
+    let rows = inner.height.saturating_sub(2) as usize;
+    let first = sel.saturating_sub(rows.saturating_sub(1));
+    let mut lines = vec![];
+    for (i, stop) in stops.iter().enumerate().skip(first).take(rows) {
+        let mark = if stop.has_unseen_update() {
+            Span::from("✦ ").yellow().bold()
+        } else if stop.freshness.is_visited() {
+            Span::from("● ")
+        } else {
+            Span::from("○ ").dim()
+        };
+        let asked = match stop.thread.len() {
+            0 => String::new(),
+            n => format!("  · {}", count(n, "question")),
+        };
+        let mut line = Line::from(vec![mark, Span::from(format!("{:>2} {}", i + 1, stop.title)), Span::from(asked).dim()]);
+        if i == sel {
+            line = line.reversed();
+        }
+        view.areas.popup_rows.push((Rect::new(inner.x, inner.y + lines.len() as u16, inner.width, 1), i));
+        lines.push(line);
+    }
+    let state = &view.state;
+    let used: Vec<String> = [("planner", state.planner_usage), ("guide", state.guide_usage)]
+        .into_iter()
+        .filter(|(_, u)| u.input > 0)
+        .map(|(role, u)| format!("{role} {u}"))
+        .collect();
+    if !used.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(format!("tokens: {}", used.join(" · "))).dim());
+    }
+    view.areas.popup = popup;
+    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" stops ")), popup);
+}
+
+/// The file picker: what is typed, and the files that match it.
+fn draw_files(f: &mut Frame, view: &mut TourView, area: Rect) {
+    let Some(Popup::Files { query, sel }) = &view.popup else { return };
+    let (query, sel) = (query.clone(), *sel);
+    let found = view.matching_files(&query);
+    let sel = sel.min(found.len().saturating_sub(1));
+    if let Some(Popup::Files { sel: s, .. }) = &mut view.popup {
+        *s = sel;
+    }
+    let popup = centered(area, 80, 20);
+    f.render_widget(Clear, popup);
+    let inner = popup.inner(Margin::new(1, 1));
+    let rows = inner.height.saturating_sub(2) as usize;
+    let first = sel.saturating_sub(rows.saturating_sub(1));
+    let mut lines = vec![Line::from(vec![Span::from("› ").cyan().bold(), Span::from(format!("{query}▏"))]), Line::default()];
+    for (i, path) in found.iter().enumerate().skip(first).take(rows) {
+        let line = Line::from(path.clone());
+        view.areas.popup_rows.push((Rect::new(inner.x, inner.y + lines.len() as u16, inner.width, 1), i));
+        lines.push(if i == sel { line.reversed() } else { line });
+    }
+    view.areas.popup = popup;
+    let title = format!(" open a file · {} ", count(found.len(), "match"));
+    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), popup);
+}
+
+/// Items on screen that the person has not seen in their latest version, with that version.
+/// Answers count once they are finished.
+fn seen_candidates(view: &TourView) -> Vec<(Item, u32)> {
+    let top = view.text.top();
+    let visible = top..top + view.doc.height;
+    if view.areas.text.width == 0 {
+        return vec![];
+    }
+    let stops = &view.state.tour.stops;
+    view.doc
+        .items
+        .iter()
+        .filter(|(range, _)| range.start < visible.end && visible.start < range.end)
+        .filter_map(|&(_, item)| {
+            let freshness = match item {
+                Item::Stop(s) => stops.get(s)?.freshness,
+                Item::Answer(s, e) => {
+                    let ex = stops.get(s)?.thread.get(e)?;
+                    let done = view.state.answer_state((s, e)) == AnswerState::Done && !ex.a.is_empty();
+                    done.then_some(ex.freshness)?
+                }
+            };
+            (!freshness.is_visited() || freshness.has_unseen_update()).then_some((item, freshness.revision()))
+        })
+        .collect()
+}
+
+/// The bottom line: an error, or the keys that work right now and what the guide is doing.
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let tour = match &app.screen {
         Screen::Tour(view) => Some(view),
         Screen::Start(_) => None,
     };
-    if let Some(input) = tour.and_then(|v| v.input.as_ref()) {
-        let line = Line::from(vec![
-            Span::from(" ask › ").cyan().bold(),
-            Span::from(format!("{input}▏")),
-            Span::from("   Enter send · Esc cancel").dim(),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
-        return;
-    }
     if let Some(err) = app.error.as_ref().or(tour.and_then(|v| v.state.error.as_ref())) {
         f.render_widget(Paragraph::new(Line::from(format!(" error: {err}")).red()), area);
         return;
@@ -374,25 +703,59 @@ fn start_keys(start: &Start) -> Vec<(&'static str, &'static str)> {
 }
 
 fn tour_keys(view: &TourView) -> Vec<(&'static str, &'static str)> {
-    let mut keys = vec![("←→", "stop")];
-    keys.push(match view.focus {
-        Pane::Stops => ("↑↓", "choose"),
-        Pane::Text | Pane::Code => ("↑↓", "scroll"),
-    });
-    if view.focus == Pane::Text && !view.links.is_empty() {
-        keys.push(("Enter", "next code ref"));
+    if view.input.is_some() {
+        return vec![("Enter", "send"), ("Esc", "cancel")];
     }
-    if view.link.is_some() {
-        keys.push(("Esc", "stop's code"));
+    match view.popup {
+        Some(Popup::Outline { .. }) => return vec![("↑↓", "choose"), ("Enter", "go"), ("Esc", "close")],
+        Some(Popup::Files { .. }) => {
+            return vec![("type", "to filter"), ("↑↓", "choose"), ("Enter", "open"), ("Esc", "close")];
+        }
+        Some(Popup::Code) | None => {}
     }
-    if !view.state.tour.stops.is_empty() {
-        keys.push(("?", "ask"));
+    let mut keys = vec![];
+    match view.focus {
+        Pane::Code => {
+            keys.push(("↑↓", "line"));
+            keys.push(("Shift ↑↓", "select"));
+            keys.push(("?", if view.code.mark.is_some() { "ask about lines" } else { "ask about line" }));
+            if view.code.mark.is_some() {
+                keys.push(("Esc", "clear selection"));
+            } else if matches!(view.popup, Some(Popup::Code)) {
+                keys.push(("Esc", "back"));
+            } else if view.code.shown != Shown::Follow {
+                keys.push(("Esc", "follow the text"));
+            }
+            keys.push(("←→", "stop"));
+            if view.wide {
+                keys.push(("Tab", "text"));
+            }
+        }
+        Pane::Text => {
+            keys.push(("←→", "stop"));
+            keys.push(("↑↓", "scroll"));
+            if !view.doc.links.is_empty() {
+                keys.push(("Enter", "next code ref"));
+            }
+            if !view.state.tour.stops.is_empty() {
+                keys.push(("?", "ask"));
+            }
+            if view.state.tour.stops.get(view.current).is_some_and(|s| !s.suggestions().is_empty()) {
+                keys.push(("1-3", "suggested"));
+            }
+            if view.code.shown != Shown::Follow {
+                keys.push(("Esc", "follow the text"));
+            }
+            if view.wide {
+                keys.push(("Tab", "code"));
+            }
+        }
     }
-    if view.state.tour.stops.get(view.sel).is_some_and(|s| !s.suggestions().is_empty()) {
-        keys.push(("1-3", "suggested"));
+    keys.push(("o", "stops"));
+    keys.push(("f", "open file"));
+    if view.wide {
+        keys.push(if view.zoomed { ("z", "unzoom") } else { ("z", "zoom") });
     }
-    keys.push(("Tab", "next pane"));
-    keys.push(if view.zoomed { ("z", "unzoom") } else { ("z", "zoom") });
     keys.push(("q", "quit"));
     keys
 }
@@ -402,17 +765,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn places_notes_after_or_under_lines() {
+    fn puts_notes_after_lines_cut_to_fit() {
         let file: Vec<StyledLine> = ["fn a() {", "    b();", "}"].iter().map(|l| vec![Span::raw(*l)]).collect();
-        let target = Anchor { path: "x.rs".into(), start: 1, end: 3 };
         let note = |line, text: &str| Note { path: "x.rs".into(), line, text: text.into() };
         let notes = [note(1, "short"), note(2, "a much longer note that does not fit after the line")];
-        let lines = code_lines(&file, &target, &notes, 0, 10, 30);
+        let marks = Marks { range: Some((1, 3)), ..Default::default() };
+        let lines = code_lines(&file, &notes, 0, 10, 30, marks);
         let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert_eq!(text[0], "1▌fn a() {  ◂ short");
-        assert_eq!(text[1], "2▌    b();");
-        assert!(text[2].starts_with("      ╰ a much"), "{text:?}");
-        assert_eq!(text.last().unwrap(), "3▌}");
-        assert!(text.iter().all(|l| display_width(l) <= 30));
+        assert!(text[1].starts_with("2▌    b();  ◂ a much") && text[1].ends_with('…'), "{text:?}");
+        assert_eq!(text[2], "3▌}");
+        assert!(text.iter().all(|l| display_width(l) <= 30), "{text:?}");
+    }
+
+    #[test]
+    fn scroll_glides_to_its_target() {
+        let mut s = crate::view::Scroll::default();
+        s.to(100);
+        let mut frames = 0;
+        while s.step() {
+            frames += 1;
+        }
+        assert_eq!(s.top(), 100);
+        assert!((5..30).contains(&frames), "{frames} frames");
     }
 }

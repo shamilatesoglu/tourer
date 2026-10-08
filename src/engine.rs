@@ -8,9 +8,9 @@ use std::sync::mpsc::Sender;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{self, Agent, Event, Session};
+use crate::agent::{self, Agent, Event, Memory, Session, Usage};
 use crate::prompts;
-use crate::tour::{self, Exchange, PlanLine, Tour};
+use crate::tour::{self, Anchor, Exchange, PlanLine, StopUpdate, Tour, Update};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Role {
@@ -43,6 +43,9 @@ pub struct State {
     queue: VecDeque<(usize, usize)>,
     answering: Option<(usize, usize)>,
     pub error: Option<String>,
+    /// Tokens used since the tour was opened.
+    pub planner_usage: Usage,
+    pub guide_usage: Usage,
 }
 
 impl State {
@@ -69,7 +72,12 @@ pub struct Engine {
     generation: u64,
     planner: Option<Session>,
     guide: Option<Session>,
+    /// The guide continues a saved conversation and has not finished a turn in it yet. If it
+    /// fails now, the conversation is dropped and a new one started.
+    guide_resuming: bool,
     plan_buf: String,
+    /// Tokens used in each agent's current turn.
+    turn_usage: [Usage; 2],
     pub state: State,
 }
 
@@ -91,7 +99,9 @@ impl Engine {
             generation: 0,
             planner: None,
             guide: None,
+            guide_resuming: false,
             plan_buf: String::new(),
+            turn_usage: [Usage::default(); 2],
             state: State::default(),
         };
         match saved {
@@ -129,6 +139,7 @@ impl Engine {
     pub fn stop_agents(&mut self) {
         self.planner = None;
         self.guide = None;
+        self.guide_resuming = false;
     }
 
     pub fn is_busy(&self) -> bool {
@@ -146,12 +157,24 @@ impl Engine {
     }
 
     fn spawn(&self, role: Role) -> Result<Session> {
-        let system_prompt = match role {
-            Role::Planner => prompts::PLANNER,
-            Role::Guide => prompts::GUIDE,
+        let (system_prompt, memory) = match role {
+            Role::Planner => (prompts::PLANNER, Memory::None),
+            Role::Guide => match &self.state.tour.guide.session {
+                Some(id) => (prompts::GUIDE, Memory::Resume(id)),
+                None => (prompts::GUIDE, Memory::Keep),
+            },
         };
-        let opts = agent::Options { cwd: &self.root, system_prompt, model: self.model.as_deref() };
+        let opts = agent::Options { cwd: &self.root, system_prompt, model: self.model.as_deref(), memory };
         Session::spawn(self.agent, Tag { role, generation: self.generation }, &opts, self.tx.clone())
+    }
+
+    fn log_turn(&mut self, role: Role) {
+        let usage = std::mem::take(&mut self.turn_usage[role as usize]);
+        let role = match role {
+            Role::Planner => "planner",
+            Role::Guide => "guide",
+        };
+        eprintln!("{} ({}) {role} turn: {usage}", self.root.display(), self.agent);
     }
 
     pub fn on_agent(&mut self, tag: Tag, event: Event) {
@@ -159,6 +182,15 @@ impl Engine {
             return;
         }
         match (tag.role, event) {
+            (role, Event::Usage(usage)) => {
+                self.turn_usage[role as usize] += usage;
+                match role {
+                    Role::Planner => self.state.planner_usage += usage,
+                    Role::Guide => self.state.guide_usage += usage,
+                }
+            }
+            (Role::Planner, Event::Session(_)) => {}
+            (Role::Guide, Event::Session(id)) => self.state.tour.guide.session = Some(id),
             (Role::Planner, Event::Text(t)) => {
                 self.plan_buf.push_str(&t);
                 while let Some(i) = self.plan_buf.find('\n') {
@@ -168,6 +200,7 @@ impl Engine {
             }
             (Role::Planner, Event::Activity(a)) => self.state.planner_activity = self.relative(&a),
             (Role::Planner, Event::TurnDone(done)) => {
+                self.log_turn(Role::Planner);
                 let rest = std::mem::take(&mut self.plan_buf);
                 self.on_plan_line(&rest);
                 self.finish_planning(done.err());
@@ -184,13 +217,22 @@ impl Engine {
             }
             (Role::Guide, Event::Activity(a)) => self.state.guide_activity = self.relative(&a),
             (Role::Guide, Event::TurnDone(done)) => {
+                self.log_turn(Role::Guide);
+                self.guide_resuming = false;
                 if let Some((s, e)) = self.state.answering.take() {
                     let ex = &mut self.state.tour.stops[s].thread[e];
                     let answer = tour::split_answer(&ex.a);
+                    let updates = answer.updates;
                     (ex.notes, ex.suggested) = (answer.notes, answer.suggested);
                     ex.a = answer.text.to_string();
                     if let Err(err) = done {
                         ex.a.push_str(&format!("\n\n(guide error: {err})"));
+                    }
+                    if ex.a.is_empty() && !updates.is_empty() {
+                        ex.a = "(The guide corrected the tour.)".into();
+                    }
+                    for update in updates {
+                        self.apply_guide_update(update);
                     }
                 }
                 self.state.guide_activity.clear();
@@ -198,7 +240,16 @@ impl Engine {
             }
             (Role::Guide, Event::Exited(err)) => {
                 self.guide = None;
-                if let Some((s, e)) = self.state.answering.take() {
+                let answering = self.state.answering.take();
+                if std::mem::take(&mut self.guide_resuming) {
+                    // The saved conversation could not be continued: start a new one and ask again.
+                    eprintln!("{}: cannot continue the guide's conversation: {err}", self.root.display());
+                    self.state.tour.guide = Default::default();
+                    if let Some(at) = answering {
+                        self.state.tour.stops[at.0].thread[at.1].a.clear();
+                        self.state.queue.push_front(at);
+                    }
+                } else if let Some((s, e)) = answering {
                     self.state.tour.stops[s].thread[e].a.push_str(&format!("\n\n(guide exited: {err})"));
                 }
                 self.next_question();
@@ -212,8 +263,59 @@ impl Engine {
                 self.state.tour.title = title;
                 self.state.tour.summary = summary;
             }
-            Some(PlanLine::Stop(stop)) => self.state.tour.stops.push(stop),
+            Some(PlanLine::Stop(mut stop)) => {
+                stop.title = tour::without_number(&stop.title).to_string();
+                self.state.tour.stops.push(stop);
+            }
+            Some(PlanLine::Update(update)) => {
+                self.update_stop(update);
+            }
             None => {}
+        }
+    }
+
+    /// Applies a correction to a stop. Returns the stop's index, or `None` if there is no such stop.
+    fn update_stop(&mut self, update: StopUpdate) -> Option<usize> {
+        let i = update.stop.checked_sub(1)?;
+        self.state.tour.stops.get_mut(i)?.apply(update);
+        Some(i)
+    }
+
+    fn apply_guide_update(&mut self, update: Update) {
+        match update {
+            Update::Update(update) => {
+                // The guide knows what it wrote, so the stop need not be sent back to it.
+                if let Some(i) = self.update_stop(update) {
+                    let revision = self.state.tour.stops[i].freshness.revision();
+                    if let Some(known) = self.state.tour.guide.known.get_mut(i) {
+                        *known = revision;
+                    }
+                }
+            }
+            Update::UpdateAnswer(update) => {
+                let stop = update.stop.checked_sub(1).and_then(|s| self.state.tour.stops.get_mut(s));
+                let ex = stop.and_then(|s| s.thread.get_mut(update.question.checked_sub(1)?));
+                if let Some(ex) = ex.filter(|ex| !ex.a.is_empty()) {
+                    ex.a = update.text;
+                    if let Some(notes) = update.notes {
+                        ex.notes = notes;
+                    }
+                    ex.freshness.update();
+                }
+            }
+        }
+    }
+
+    /// Records that the person saw a stop, or one of its answers, at `revision`.
+    pub fn mark_seen(&mut self, stop: usize, exchange: Option<usize>, revision: u32) {
+        let Some(s) = self.state.tour.stops.get_mut(stop) else { return };
+        match exchange {
+            None => s.freshness.mark_seen(revision),
+            Some(e) => {
+                if let Some(ex) = s.thread.get_mut(e) {
+                    ex.freshness.mark_seen(revision);
+                }
+            }
         }
     }
 
@@ -235,14 +337,15 @@ impl Engine {
         activity.replace(&prefix, "")
     }
 
-    /// Queues a question at a stop (0-based). Returns where its answer will appear.
-    pub fn ask(&mut self, stop: usize, q: &str) -> Option<(usize, usize)> {
+    /// Queues a question at a stop (0-based), optionally about some lines of code. Returns where
+    /// its answer will appear.
+    pub fn ask(&mut self, stop: usize, q: &str, code: Option<Anchor>) -> Option<(usize, usize)> {
         let q = q.trim();
         let s = self.state.tour.stops.get_mut(stop)?;
         if q.is_empty() {
             return None;
         }
-        s.thread.push(Exchange { q: q.to_string(), a: String::new(), notes: vec![], suggested: vec![] });
+        s.thread.push(Exchange { q: q.to_string(), code, ..Default::default() });
         let at = (stop, s.thread.len() - 1);
         self.state.queue.push_back(at);
         if self.state.answering.is_none() {
@@ -253,9 +356,8 @@ impl Engine {
 
     fn next_question(&mut self) {
         let Some((s, e)) = self.state.queue.pop_front() else { return };
-        let tour = &self.state.tour;
-        let stop = &tour.stops[s];
-        let msg = prompts::question(s + 1, tour.stops.len(), stop, &stop.thread[e].q);
+        let resuming = self.guide.is_none() && self.state.tour.guide.session.is_some();
+        let msg = self.question_message(s, e);
         let sent = match self.guide.take() {
             Some(g) => Ok(g),
             None => self.spawn(Role::Guide),
@@ -264,6 +366,9 @@ impl Engine {
         match sent {
             Ok(g) => {
                 self.guide = Some(g);
+                self.guide_resuming |= resuming;
+                let tour = &mut self.state.tour;
+                tour.guide.known = tour.stops.iter().map(|s| s.freshness.revision()).collect();
                 self.state.answering = Some((s, e));
                 self.state.guide_activity = "thinking".into();
             }
@@ -272,5 +377,31 @@ impl Engine {
                 self.next_question();
             }
         }
+    }
+
+    /// The message for question `e` at stop `s`, with the stops the guide has not seen as they
+    /// are now, and the selected code.
+    fn question_message(&self, s: usize, e: usize) -> String {
+        let tour = &self.state.tour;
+        let known = &tour.guide.known;
+        let changed: Vec<_> = tour
+            .stops
+            .iter()
+            .enumerate()
+            .filter(|(i, stop)| known.get(*i) != Some(&stop.freshness.revision()))
+            .collect();
+        let stop = &tour.stops[s];
+        let ex = &stop.thread[e];
+        let lines = ex.code.as_ref().map(|a| self.lines(a));
+        let code = ex.code.as_ref().zip(lines.as_deref());
+        prompts::question(&changed, s + 1, tour.stops.len(), e + 1, stop, code, &ex.q)
+    }
+
+    /// The text of an anchor's lines, at most 200 of them.
+    fn lines(&self, a: &Anchor) -> String {
+        let text = std::fs::read(self.root.join(&a.path)).map(|b| String::from_utf8_lossy(&b).into_owned());
+        let text = text.unwrap_or_default();
+        let count = (a.end + 1).saturating_sub(a.start).min(200);
+        text.lines().skip(a.start.saturating_sub(1)).take(count).collect::<Vec<_>>().join("\n")
     }
 }

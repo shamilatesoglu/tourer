@@ -15,9 +15,9 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::agent::Agent;
-use crate::daemon::{self, Client, Reply, Request, Shared};
+use crate::daemon::{self, Client, Reads, Reply, Request, Shared};
 use crate::engine::{AnswerState, Engine};
-use crate::tour::{Anchor, Note};
+use crate::tour::{self, Anchor, Note};
 
 const PLAN_WAIT: Duration = Duration::from_secs(60);
 const ANSWER_WAIT: Duration = Duration::from_secs(300);
@@ -94,11 +94,12 @@ fn tools() -> Value {
         },
         {
             "name": "ask",
-            "description": "Ask the tour guide a question about the folder. The guide reads the code to answer and cites it as [path:start-end]. Give the stop you are at for context.",
+            "description": "Ask the tour guide a question about the folder. The guide reads the code to answer and cites it as [path:start-end]. Give the stop you are at for context. The guide may also correct earlier stops and answers; the reply says which stops changed.",
             "inputSchema": {"type": "object", "properties": {
                 "path": path,
                 "question": {"type": "string"},
                 "stop": {"type": "integer", "minimum": 1, "description": "The stop you are at. Defaults to 1."},
+                "code": {"type": "string", "description": "Lines the question is about, as relative/path:start-end."},
             }, "required": ["question"]},
         },
     ])
@@ -165,18 +166,29 @@ impl Server {
     }
 }
 
-/// Runs a tool call on a tour. Called by the daemon.
-pub fn call(shared: &Shared, name: &str, args: &Value) -> Result<String> {
+/// Runs a tool call on a tour for a client that has read what `read` records. Called by the daemon.
+pub fn call(shared: &Shared, name: &str, args: &Value, read: &Reads) -> Result<String> {
     let number = |key: &str| args[key].as_u64().map(|n| n.max(1) as usize);
     let planning_before = |n: usize| move |e: &Engine| e.state.planning && e.state.tour.stops.len() < n;
     match name {
-        "tour" => Ok(outline(&shared.wait(PLAN_WAIT, |e| e.state.planning))),
+        "tour" => Ok(outline(&shared.wait(PLAN_WAIT, |e| e.state.planning), &read.lock().unwrap())),
         "stop" => {
             let n = number("number").context("`number` is required")?;
-            stop_text(&shared.wait(PLAN_WAIT, planning_before(n)), n)
+            let engine = shared.wait(PLAN_WAIT, planning_before(n));
+            let text = stop_text(&engine, n)?;
+            read.lock().unwrap().insert(n - 1, engine.state.tour.stops[n - 1].version());
+            Ok(text)
         }
         "ask" => {
             let q = args["question"].as_str().context("`question` is required")?;
+            let code = match args["code"].as_str() {
+                Some(code) => {
+                    let code = format!("[{}]", code.trim().trim_matches(['[', ']']));
+                    let found = tour::refs(&code).into_iter().next().map(|(_, a)| a);
+                    Some(found.context("`code` must look like relative/path:start-end")?)
+                }
+                None => None,
+            };
             let n = number("stop").unwrap_or(1);
             let n = {
                 let engine = shared.wait(PLAN_WAIT, planning_before(n));
@@ -185,7 +197,9 @@ pub fn call(shared: &Shared, name: &str, args: &Value) -> Result<String> {
                     n => n,
                 }
             };
-            let at = shared.update(|e| e.ask(n - 1, q)).context("no such stop")?;
+            let versions = |e: &Engine| e.state.tour.stops.iter().map(|s| s.version()).collect::<Vec<_>>();
+            let (at, before) = shared.update(|e| (e.ask(n - 1, q, code), versions(e)));
+            let at = at.context("no such stop")?;
             let engine = shared.wait(ANSWER_WAIT, |e| e.state.answer_state(at) != AnswerState::Done);
             if engine.state.answer_state(at) != AnswerState::Done {
                 return Err(anyhow!("the guide is still answering; ask again later"));
@@ -193,6 +207,19 @@ pub fn call(shared: &Shared, name: &str, args: &Value) -> Result<String> {
             let ex = engine.state.tour.stops.get(at.0).and_then(|s| s.thread.get(at.1));
             let ex = ex.context("the tour was planned again while answering")?;
             let mut text = ex.a.clone();
+            // Stops whose text or answers the guide corrected while answering.
+            let after = versions(&engine);
+            let updated: Vec<String> = (0..after.len())
+                .filter(|&i| before.get(i).is_some_and(|b| *b != after[i]))
+                .map(|i| (i + 1).to_string())
+                .collect();
+            if !updated.is_empty() {
+                let _ = write!(
+                    text,
+                    "\n\nThe guide also corrected stop {}; read it again with `stop`.",
+                    updated.join(", ")
+                );
+            }
             if !ex.notes.is_empty() {
                 text.push_str("\n\nNotes on lines:\n");
                 for n in &ex.notes {
@@ -218,7 +245,7 @@ fn no_stops(engine: &Engine) -> anyhow::Error {
     }
 }
 
-fn outline(engine: &Engine) -> String {
+fn outline(engine: &Engine, read: &HashMap<usize, u32>) -> String {
     let tour = &engine.state.tour;
     if tour.stops.is_empty() {
         return no_stops(engine).to_string();
@@ -226,7 +253,9 @@ fn outline(engine: &Engine) -> String {
     let mut s = format!("# {}\n\n{}\n\n", tour.title, tour.summary);
     for (i, stop) in tour.stops.iter().enumerate() {
         let anchors: Vec<String> = stop.anchors.iter().map(|a| a.to_string()).collect();
-        let _ = writeln!(s, "{}. {} {}", i + 1, stop.title, anchors.join(" "));
+        let updated = read.get(&i).is_some_and(|&v| v < stop.version());
+        let updated = if updated { " (updated since you read it)" } else { "" };
+        let _ = writeln!(s, "{}. {} {}{updated}", i + 1, stop.title, anchors.join(" "));
     }
     if engine.state.planning {
         s.push_str("\nThe tour is still being planned; call `tour` again for the remaining stops.\n");
@@ -250,7 +279,9 @@ fn stop_text(engine: &Engine, n: usize) -> Result<String> {
         let _ = write!(s, "\n### {a}\n```\n{}```\n", excerpt(engine.root(), a, &notes));
     }
     for ex in &stop.thread {
-        let _ = write!(s, "\n## Q: {}\n\n{}\n", ex.q, if ex.a.is_empty() { "(not answered yet)" } else { &ex.a });
+        let about = ex.code.as_ref().map(|a| format!("{a} ")).unwrap_or_default();
+        let a = if ex.a.is_empty() { "(not answered yet)" } else { &ex.a };
+        let _ = write!(s, "\n## Q: {about}{}\n\n{a}\n", ex.q);
     }
     let suggestions = stop.suggestions();
     if !suggestions.is_empty() {

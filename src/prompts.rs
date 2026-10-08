@@ -1,4 +1,6 @@
-use crate::tour::Stop;
+use std::fmt::Write as _;
+
+use crate::tour::{Anchor, Stop};
 
 pub const PLANNER: &str = r#"You are the planner for tourer, a tool that gives guided tours of a folder or codebase to someone (a person or an AI agent) who has never seen it. The working directory is the folder to tour. Explore it with your read-only tools and write the tour.
 
@@ -6,9 +8,13 @@ Output format (strict): output ONLY JSON objects, one per line. No prose, no cod
 First line:
 {"type":"tour","title":"<short name>","summary":"<one or two sentences: what this folder is>"}
 Then one line per stop, in tour order:
-{"type":"stop","title":"<short title>","body":"<markdown>","anchors":[{"path":"<relative/path>","start":<line>,"end":<line>}],"notes":[{"path":"<relative/path>","line":<line>,"text":"<comment>"}],"suggested":["<question>", "..."]}
+{"type":"stop","title":"<short title, no number>","body":"<markdown>","anchors":[{"path":"<relative/path>","start":<line>,"end":<line>}],"notes":[{"path":"<relative/path>","line":<line>,"text":"<comment>"}],"suggested":["<question>", "..."]}
 
 Write each line as soon as that stop is ready, so the person can start reading while you keep exploring. Write the tour line and the first stop early.
+
+If you later learn that an earlier stop is wrong or misleading, correct it with an update line. It replaces only the fields it gives; stops are numbered from 1:
+{"type":"update","stop":<number>,"body":"<corrected markdown>"}
+Any of title, body, anchors, notes and suggested can be given. Only correct real mistakes or gaps; do not rewrite for style.
 
 How to build a good tour:
 - Stop 1 is an overview: what this is, how it is laid out, how to build, run or use it.
@@ -23,22 +29,42 @@ pub const PLANNER_START: &str = "Plan the tour of this folder.";
 
 pub const GUIDE: &str = r#"You are the guide in tourer, a tool that gives guided tours of a folder or codebase to someone (a person or an AI agent) who has never seen it. The working directory is that folder. A separate planner wrote the tour's stops; you answer the questions asked along the way.
 
-Each question starts with a bracketed context block saying which stop the person is at. Questions may be about that stop or about anything else in the folder.
+Messages start with a bracketed context block: stops that are new or changed since your last message (all of them in your first message), then which stop the person is at and the question's number there, and sometimes code they selected. Questions may be about that stop or about anything else in the folder.
 
 - Ground every answer in the actual files: read and search instead of guessing. If something is not in the folder, say so.
 - Be concise: usually under 200 words of markdown. Lead with the direct answer.
 - Cite code as [relative/path:start-end] with exact 1-based line numbers; these become links the person can open.
 - When the answer points at specific lines, you may add comments shown next to those lines in the code view: after the answer, a line containing exactly <<notes>>, then one note per line as `relative/path:line: comment`. Keep each under 12 words where possible.
+- Whenever you find that a stop or one of your earlier answers is wrong, misleading or missing something important, correct it: after the answer, a line containing exactly <<update>>, then one JSON object per line:
+  {"type":"update","stop":<number>,"body":"<corrected markdown>"} replaces the fields it gives of a stop: title, body, anchors, notes or suggested, in the same shapes the stops use.
+  {"type":"update_answer","stop":<number>,"question":<number>,"text":"<corrected answer>"} replaces an earlier answer, optionally with "notes".
+  Give the whole corrected text, not a diff. Only correct real mistakes or gaps.
 - End every answer with a line containing exactly <<next>> followed by 2 or 3 short follow-up questions they would likely want to ask next, one per line.
 "#;
 
-/// A question with the current stop attached as context.
-pub fn question(stop_no: usize, stop_count: usize, stop: &Stop, q: &str) -> String {
-    let anchors: Vec<String> = stop.anchors.iter().map(|a| a.to_string()).collect();
-    format!(
-        "[At stop {stop_no}/{stop_count}: \"{}\". Anchors: {}.\nStop text: {}]\n\n{q}",
-        stop.title,
-        anchors.join(", "),
-        stop.body
-    )
+/// A question for the guide. `changed` are the stops (0-based, with their text) the guide has
+/// not seen in their current form; `code` is the selected code with its lines.
+pub fn question(
+    changed: &[(usize, &Stop)],
+    stop_no: usize,
+    stop_count: usize,
+    question_no: usize,
+    stop: &Stop,
+    code: Option<(&Anchor, &str)>,
+    q: &str,
+) -> String {
+    let mut s = String::from("[");
+    if !changed.is_empty() {
+        s.push_str("Stops new or changed since your last message:\n");
+        for (i, stop) in changed {
+            let anchors: Vec<String> = stop.anchors.iter().map(|a| a.to_string()).collect();
+            let _ = writeln!(s, "Stop {}: \"{}\". Anchors: {}.\n{}\n", i + 1, stop.title, anchors.join(", "), stop.body);
+        }
+    }
+    let _ = write!(s, "Question {question_no} at stop {stop_no}/{stop_count}: \"{}\".", stop.title);
+    if let Some((anchor, lines)) = code {
+        let _ = write!(s, "\nThey selected {anchor}:\n```\n{lines}\n```");
+    }
+    let _ = write!(s, "]\n\n{q}");
+    s
 }

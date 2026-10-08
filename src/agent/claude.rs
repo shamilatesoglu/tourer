@@ -9,7 +9,7 @@ use std::thread;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use super::{Agent, Event, Options, tail};
+use super::{Agent, Event, Memory, Options, Usage, tail};
 
 pub struct Session {
     child: Child,
@@ -23,10 +23,18 @@ impl Session {
             .args(["-p", "--verbose", "--include-partial-messages"])
             .args(["--input-format", "stream-json", "--output-format", "stream-json"])
             .args(["--tools", "Read,Grep,Glob", "--strict-mcp-config"])
-            .args(["--no-session-persistence", "--disable-slash-commands"])
-            .args(["--append-system-prompt", opts.system_prompt]);
+            .args(["--disable-slash-commands", "--append-system-prompt", opts.system_prompt]);
         if let Some(model) = opts.model {
             cmd.args(["--model", model]);
+        }
+        match opts.memory {
+            Memory::None => {
+                cmd.arg("--no-session-persistence");
+            }
+            Memory::Keep => {}
+            Memory::Resume(id) => {
+                cmd.args(["--resume", id]);
+            }
         }
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -103,7 +111,16 @@ fn decode(v: &Value, text_in_turn: &mut bool) -> Vec<Event> {
                 Event::Activity(format!("{} {}", c["name"].as_str().unwrap_or("?"), target))
             })
             .collect(),
+        Some("system") if v["subtype"] == "init" => match v["session_id"].as_str() {
+            Some(id) => vec![Event::Session(id.to_string())],
+            None => vec![],
+        },
         Some("result") => {
+            let u = &v["usage"];
+            let count = |key: &str| u[key].as_u64().unwrap_or(0);
+            let cached = count("cache_read_input_tokens");
+            let input = count("input_tokens") + count("cache_creation_input_tokens") + cached;
+            let usage = Event::Usage(Usage { input, cached, output: count("output_tokens") });
             *text_in_turn = false;
             let done = if v["is_error"].as_bool().unwrap_or(false) {
                 let reason = v["result"].as_str().or(v["subtype"].as_str()).unwrap_or("error");
@@ -111,7 +128,7 @@ fn decode(v: &Value, text_in_turn: &mut bool) -> Vec<Event> {
             } else {
                 Ok(())
             };
-            vec![Event::TurnDone(done)]
+            vec![usage, Event::TurnDone(done)]
         }
         _ => vec![],
     }

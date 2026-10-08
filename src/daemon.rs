@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::agent::Agent;
 use crate::engine::{Engine, State};
 use crate::mcp;
-use crate::tour::Tour;
+use crate::tour::{Anchor, Tour};
 
 /// How long the daemon stays up with no clients and no agent at work.
 const IDLE_EXIT: Duration = Duration::from_secs(10 * 60);
@@ -38,7 +38,10 @@ pub enum Request {
     List { root: PathBuf },
     /// Opens a folder's tour and sends its state now and whenever it changes.
     Open { root: PathBuf, agent: Agent, model: Option<String>, replan: bool },
-    Ask { root: PathBuf, agent: Agent, stop: usize, question: String },
+    /// Asks a question at a stop, optionally about some lines of code.
+    Ask { root: PathBuf, agent: Agent, stop: usize, question: String, code: Option<Anchor> },
+    /// The person saw a stop, or one of its answers, at this revision.
+    Seen { root: PathBuf, agent: Agent, stop: usize, exchange: Option<usize>, revision: u32 },
     /// An MCP tool call, answered with [`Reply::Tool`].
     Tool { id: u64, root: PathBuf, agent: Agent, model: Option<String>, name: String, arguments: Value },
 }
@@ -211,6 +214,8 @@ fn detach(cmd: &mut Command) -> Result<()> {
 pub struct Shared {
     hosted: Mutex<Hosted>,
     changed: Condvar,
+    /// Where the tour is saved.
+    file: PathBuf,
 }
 
 struct Hosted {
@@ -235,7 +240,22 @@ impl Shared {
         let hosted = self.hosted.lock().unwrap();
         EngineGuard(self.changed.wait_timeout_while(hosted, timeout, |h| busy(&h.engine)).unwrap().0)
     }
+
+    /// Saves the tour, once it has stops and planning is over.
+    fn save(&self, tour: Option<Tour>) {
+        let Some(tour) = tour else { return };
+        if let Err(err) = save(&self.file, &tour) {
+            eprintln!("cannot save {}: {err:#}", self.file.display());
+        }
+    }
+
+    fn tour_to_save(engine: &Engine) -> Option<Tour> {
+        (!engine.state.planning && !engine.state.tour.stops.is_empty()).then(|| engine.state.tour.clone())
+    }
 }
+
+/// What one MCP client last read of each stop, by stop index, so outlines can point out updates.
+pub type Reads = Mutex<HashMap<usize, u32>>;
 
 pub struct EngineGuard<'a>(MutexGuard<'a, Hosted>);
 
@@ -319,10 +339,11 @@ impl Daemon {
 
         self.clients.fetch_add(1, Ordering::SeqCst);
         let connected = Arc::new(AtomicBool::new(true));
+        let mut reads = HashMap::new();
         let result = (|| -> Result<()> {
             for line in lines {
                 let request: Request = serde_json::from_str(&line?)?;
-                if let Err(err) = self.handle(request, &out, &connected) {
+                if let Err(err) = self.handle(request, &out, &connected, &mut reads) {
                     write_line(&mut *out.lock().unwrap(), &Reply::Error { message: format!("{err:#}") })?;
                 }
             }
@@ -334,7 +355,13 @@ impl Daemon {
         result
     }
 
-    fn handle(&self, request: Request, out: &Arc<Mutex<TcpStream>>, connected: &Arc<AtomicBool>) -> Result<()> {
+    fn handle(
+        &self,
+        request: Request,
+        out: &Arc<Mutex<TcpStream>>,
+        connected: &Arc<AtomicBool>,
+        reads: &mut HashMap<(PathBuf, Agent), Arc<Reads>>,
+    ) -> Result<()> {
         match request {
             Request::Hello { .. } => bail!("hello sent twice"),
             Request::List { root } => {
@@ -349,15 +376,24 @@ impl Daemon {
                 let (out, connected) = (out.clone(), connected.clone());
                 thread::spawn(move || watch(&shared, &root, &out, &connected));
             }
-            Request::Ask { root, agent, stop, question } => {
-                let shared = self.tours.lock().unwrap().get(&(root, agent)).cloned().context("open the tour first")?;
-                shared.update(|e| e.ask(stop, &question)).context("no such stop")?;
+            Request::Ask { root, agent, stop, question, code } => {
+                let shared = self.hosted(root, agent)?;
+                shared.update(|e| e.ask(stop, &question, code)).context("no such stop")?;
+            }
+            Request::Seen { root, agent, stop, exchange, revision } => {
+                let shared = self.hosted(root, agent)?;
+                let tour = shared.update(|e| {
+                    e.mark_seen(stop, exchange, revision);
+                    Shared::tour_to_save(e)
+                });
+                shared.save(tour);
             }
             Request::Tool { id, root, agent, model, name, arguments } => {
+                let read = reads.entry((root.clone(), agent)).or_default().clone();
                 let shared = self.tour(&root, agent, model)?;
                 let out = out.clone();
                 thread::spawn(move || {
-                    let (text, is_error) = match mcp::call(&shared, &name, &arguments) {
+                    let (text, is_error) = match mcp::call(&shared, &name, &arguments, &read) {
                         Ok(text) => (text, false),
                         Err(err) => (format!("{err:#}"), true),
                     };
@@ -366,6 +402,11 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// A tour that a front-end has opened.
+    fn hosted(&self, root: PathBuf, agent: Agent) -> Result<Arc<Shared>> {
+        self.tours.lock().unwrap().get(&(root, agent)).cloned().context("open the tour first")
     }
 
     /// A folder's tours, one per agent at most: hosted ones, else saved ones.
@@ -404,20 +445,17 @@ impl Daemon {
         let file = self.tour_file(root, agent);
         let (tx, rx) = mpsc::channel();
         let engine = Engine::new(root.to_path_buf(), agent, model, tx, self.saved(root, agent))?;
-        let shared = Arc::new(Shared { hosted: Mutex::new(Hosted { engine, version: 0 }), changed: Condvar::new() });
+        let hosted = Mutex::new(Hosted { engine, version: 0 });
+        let shared = Arc::new(Shared { hosted, changed: Condvar::new(), file });
         let pump = shared.clone();
         thread::spawn(move || {
             for (tag, event) in rx {
                 let turn_ended = matches!(event, crate::agent::Event::TurnDone(_) | crate::agent::Event::Exited(_));
                 let tour = pump.update(|e| {
                     e.on_agent(tag, event);
-                    (turn_ended && !e.state.planning && !e.state.tour.stops.is_empty()).then(|| e.state.tour.clone())
+                    if turn_ended { Shared::tour_to_save(e) } else { None }
                 });
-                if let Some(tour) = tour
-                    && let Err(err) = save(&file, &tour)
-                {
-                    eprintln!("cannot save {}: {err:#}", file.display());
-                }
+                pump.save(tour);
             }
         });
         tours.insert(key, shared.clone());
