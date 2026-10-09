@@ -287,7 +287,7 @@ impl Decoder {
                 self.text_in_turn = false;
                 let turn = &params["turn"];
                 let done = match turn["status"].as_str() {
-                    Some("completed") => Ok(()),
+                    Some("completed") => Ok("completed".to_string()),
                     status => Err(turn["error"]["message"]
                         .as_str()
                         .or(status)

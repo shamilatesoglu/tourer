@@ -10,7 +10,10 @@ First line:
 Then one line per stop, in tour order:
 {"type":"stop","title":"<short title, no number>","body":"<markdown>","anchors":[{"path":"<relative/path>","start":<line>,"end":<line>}],"notes":[{"path":"<relative/path>","line":<line>,"text":"<comment>"}],"suggested":["<question>", "..."]}
 
-Write each line as soon as that stop is ready, so the person can start reading while you keep exploring. Write the tour line and the first stop early.
+After the last stop, a final line:
+{"type":"done"}
+
+Write each line as soon as that stop is ready, so the person can start reading while you keep exploring. Write the tour line and the first stop early. Your turn ends as soon as you send a message without a tool call, so while there is more to explore, put the lines you have ready in the same message as your next tool call. End your turn only after the done line.
 
 If you later learn that an earlier stop is wrong or misleading, correct it with an update line. It replaces only the fields it gives; stops are numbered from 1:
 {"type":"update","stop":<number>,"body":"<corrected markdown>"}
@@ -26,6 +29,11 @@ How to build a good tour:
 "#;
 
 pub const PLANNER_START: &str = "Plan the tour of this folder.";
+
+/// Sent when the planner ends its turn before writing the done line.
+pub fn planner_continue(stops: usize) -> String {
+    format!("Your turn ended after {stops} stops without the done line. Continue the tour from stop {}, or write the done line if it is complete.", stops + 1)
+}
 
 pub const GUIDE: &str = r#"You are the guide in tourer, a tool that gives guided tours of a folder or codebase to someone (a person or an AI agent) who has never seen it. The working directory is that folder. A separate planner wrote the tour's stops; you answer the questions asked along the way.
 

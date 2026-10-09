@@ -12,6 +12,9 @@ use crate::agent::{self, Agent, Event, Memory, Session, Usage};
 use crate::prompts;
 use crate::tour::{self, Anchor, Exchange, PlanLine, StopUpdate, Tour, Update};
 
+/// How often a planner that ends its turn without the done line is asked to go on.
+const MAX_PLAN_CONTINUES: u32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Role {
     Planner,
@@ -76,6 +79,10 @@ pub struct Engine {
     /// fails now, the conversation is dropped and a new one started.
     guide_resuming: bool,
     plan_buf: String,
+    /// The planner wrote its done line.
+    plan_done: bool,
+    /// Times the planner was asked to go on after ending its turn without the done line.
+    plan_continues: u32,
     /// Tokens used in each agent's current turn.
     turn_usage: [Usage; 2],
     pub state: State,
@@ -101,6 +108,8 @@ impl Engine {
             guide: None,
             guide_resuming: false,
             plan_buf: String::new(),
+            plan_done: false,
+            plan_continues: 0,
             turn_usage: [Usage::default(); 2],
             state: State::default(),
         };
@@ -150,6 +159,7 @@ impl Engine {
         self.state.tour = Tour { version: 1, root: self.root.display().to_string(), ..Default::default() };
         self.state.planning = true;
         self.state.planner_activity = "starting".into();
+        (self.plan_done, self.plan_continues) = (false, 0);
         let mut planner = self.spawn(Role::Planner)?;
         planner.send(prompts::PLANNER_START)?;
         self.planner = Some(planner);
@@ -168,13 +178,17 @@ impl Engine {
         Session::spawn(self.agent, Tag { role, generation: self.generation }, &opts, self.tx.clone())
     }
 
-    fn log_turn(&mut self, role: Role) {
+    fn log_turn(&mut self, role: Role, done: &Result<String, String>) {
         let usage = std::mem::take(&mut self.turn_usage[role as usize]);
         let role = match role {
             Role::Planner => "planner",
             Role::Guide => "guide",
         };
-        eprintln!("{} ({}) {role} turn: {usage}", self.root.display(), self.agent);
+        let ended = match done {
+            Ok(reason) => reason,
+            Err(err) => err,
+        };
+        eprintln!("{} ({}) {role} turn: {usage}; ended: {ended}", self.root.display(), self.agent);
     }
 
     pub fn on_agent(&mut self, tag: Tag, event: Event) {
@@ -200,10 +214,14 @@ impl Engine {
             }
             (Role::Planner, Event::Activity(a)) => self.state.planner_activity = self.relative(&a),
             (Role::Planner, Event::TurnDone(done)) => {
-                self.log_turn(Role::Planner);
+                self.log_turn(Role::Planner, &done);
                 let rest = std::mem::take(&mut self.plan_buf);
                 self.on_plan_line(&rest);
-                self.finish_planning(done.err());
+                if done.is_ok() && !self.plan_done && self.plan_continues < MAX_PLAN_CONTINUES {
+                    self.continue_planning();
+                } else {
+                    self.finish_planning(done.err());
+                }
             }
             (Role::Planner, Event::Exited(err)) => {
                 if self.state.planning {
@@ -217,7 +235,7 @@ impl Engine {
             }
             (Role::Guide, Event::Activity(a)) => self.state.guide_activity = self.relative(&a),
             (Role::Guide, Event::TurnDone(done)) => {
-                self.log_turn(Role::Guide);
+                self.log_turn(Role::Guide, &done);
                 self.guide_resuming = false;
                 if let Some((s, e)) = self.state.answering.take() {
                     let ex = &mut self.state.tour.stops[s].thread[e];
@@ -270,6 +288,7 @@ impl Engine {
             Some(PlanLine::Update(update)) => {
                 self.update_stop(update);
             }
+            Some(PlanLine::Done) => self.plan_done = true,
             None => {}
         }
     }
@@ -316,6 +335,25 @@ impl Engine {
                     ex.freshness.mark_seen(revision);
                 }
             }
+        }
+    }
+
+    /// Asks a planner that ended its turn too early to go on with the tour.
+    fn continue_planning(&mut self) {
+        self.plan_continues += 1;
+        let stops = self.state.tour.stops.len();
+        eprintln!(
+            "{} ({}) planner stopped after {stops} stops without the done line; asking it to continue ({}/{MAX_PLAN_CONTINUES})",
+            self.root.display(),
+            self.agent,
+            self.plan_continues
+        );
+        let sent = match self.planner.as_mut() {
+            Some(planner) => planner.send(&prompts::planner_continue(stops)),
+            None => return,
+        };
+        if let Err(err) = sent {
+            self.finish_planning(Some(format!("cannot continue planning: {err}")));
         }
     }
 

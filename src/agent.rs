@@ -65,8 +65,8 @@ pub enum Event {
     Text(String),
     /// What the agent is doing, e.g. "Read src/main.rs".
     Activity(String),
-    /// The agent finished responding to the last message.
-    TurnDone(Result<(), String>),
+    /// The agent finished responding to the last message. `Ok` says why the turn ended, for the log.
+    TurnDone(Result<String, String>),
     /// The process ended; carries the tail of stderr.
     Exited(String),
     /// The agent's id for a kept conversation, to continue it later with [`Memory::Resume`].

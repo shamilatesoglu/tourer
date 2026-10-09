@@ -173,6 +173,8 @@ pub enum PlanLine {
     Tour { title: String, summary: String },
     Stop(Stop),
     Update(StopUpdate),
+    /// The planner wrote its last stop.
+    Done,
 }
 
 /// Replaces fields of an earlier stop. Fields left out stay as they are.
@@ -310,6 +312,7 @@ mod tests {
         let Some(PlanLine::Stop(s)) = parse_plan_line(stop) else { panic!() };
         assert_eq!(s.anchors[0].end, 4);
         assert!(parse_plan_line("Let me look around.").is_none());
+        assert!(matches!(parse_plan_line(r#"{"type":"done"}"#), Some(PlanLine::Done)));
     }
 
     #[test]

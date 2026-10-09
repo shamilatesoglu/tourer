@@ -126,7 +126,8 @@ fn decode(v: &Value, text_in_turn: &mut bool) -> Vec<Event> {
                 let reason = v["result"].as_str().or(v["subtype"].as_str()).unwrap_or("error");
                 Err(reason.to_string())
             } else {
-                Ok(())
+                let reason = v["stop_reason"].as_str().unwrap_or("?");
+                Ok(format!("{reason} after {} model calls", v["num_turns"].as_u64().unwrap_or(0)))
             };
             vec![usage, Event::TurnDone(done)]
         }
