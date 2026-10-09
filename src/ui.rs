@@ -17,7 +17,7 @@ use crate::engine::AnswerState;
 use crate::highlight::StyledLine;
 use crate::markdown::Renderer;
 use crate::tour::{self, Note, Stop};
-use crate::view::{Areas, Doc, Item, Pane, Popup, Shown, Target, TourView};
+use crate::view::{Areas, Doc, Item, Pane, Popup, Shown, Step, Target, TourView};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(f.area());
@@ -157,7 +157,10 @@ fn draw_tour(f: &mut Frame, view: &mut TourView, area: Rect) {
         Some(_) if view.text.is_moving() => {}
         _ => {
             view.jump = None;
-            view.current = view.doc.stop_lines.iter().rposition(|&l| l <= view.text.top() + 1).unwrap_or(0);
+            view.current = match view.step {
+                Some(step) => step.stop(),
+                None => view.doc.stop_lines.iter().rposition(|&l| l <= view.text.top() + 1).unwrap_or(0),
+            };
         }
     }
 
@@ -221,7 +224,11 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
         Shown::Ref(a) => Some(a.clone()),
         _ => None,
     };
-    let selected = shown.and_then(|a| view.doc.links.iter().position(|l| *l == a));
+    let selected = match view.step.and_then(|step| view.step_link(step)) {
+        Some(i) => Some(i),
+        None => shown.and_then(|a| view.doc.links.iter().position(|l| *l == a)),
+    };
+    let step = view.step;
     if let Some(i) = view.jump {
         view.current = i;
     }
@@ -231,6 +238,10 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
     let mut doc = Doc { height, ..Default::default() };
     let mut spots = vec![];
     let unseen = Span::from(" ✦").yellow().bold();
+    // Steps other than code references, found while rendering.
+    let mut steps: Vec<(Step, usize)> = vec![];
+    // Per stop: its links, and how many of them are in the header's list of anchors.
+    let mut stop_links = vec![];
 
     if !state.tour.title.is_empty() {
         r.lines.push(Line::from(state.tour.title.clone()).bold());
@@ -241,8 +252,13 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
     for (i, stop) in state.tour.stops.iter().enumerate() {
         doc.stop_lines.push(r.lines.len());
         let start = r.lines.len();
+        let first_link = r.links.len();
         r.lines.push(Line::from("─".repeat(width)).dim());
-        let mut header = vec![Span::from(format!("{} ", i + 1)).cyan().bold(), Span::from(stop.title.clone()).bold()];
+        let mut number = Span::from(format!("{} ", i + 1)).cyan().bold();
+        if step == Some(Step::Stop(i)) {
+            number = number.reversed();
+        }
+        let mut header = vec![number, Span::from(stop.title.clone()).bold()];
         if stop.freshness.has_unseen_update() {
             header.push(unseen.clone());
         }
@@ -251,6 +267,7 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
         if !anchors.is_empty() {
             r.text(&anchors.join(" "), Style::new(), "", "");
         }
+        let header_links = r.links.len() - first_link;
         r.blank();
         r.markdown(&stop.body, "");
         if let Some(lines) = excerpts.get(i) {
@@ -263,7 +280,9 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
             r.blank();
             let about = ex.code.as_ref().map(|a| format!("{a} ")).unwrap_or_default();
             let style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-            r.text(&format!("{about}{}", ex.q), style, "› ", "  ");
+            steps.push((Step::Answer(i, e), r.lines.len()));
+            let marker = if step == Some(Step::Answer(i, e)) { "▶ " } else { "› " };
+            r.text(&format!("{about}{}", ex.q), style, marker, "  ");
             if ex.freshness.has_unseen_update()
                 && let Some(last) = r.lines.last_mut()
             {
@@ -281,23 +300,38 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
             doc.items.push((start..r.lines.len(), Item::Answer(i, e)));
         }
         doc.thread_ends.push(r.lines.len());
+        stop_links.push((first_link..r.links.len(), header_links));
 
         // Every stop shows its suggestions, so the layout does not shift as the current stop
-        // changes; the current stop's stand out, and only they have number keys.
+        // changes; the current stop's stand out, and only they have number keys. The last row
+        // asks a question of one's own.
         let suggestions = stop.suggestions();
-        if !suggestions.is_empty() {
-            r.blank();
-        }
-        for (k, s) in suggestions.iter().enumerate() {
+        let ask = if suggestions.is_empty() { "Ask a question" } else { "Ask a different question" };
+        let rows = suggestions.iter().map(String::as_str).chain([ask]);
+        r.blank();
+        for (k, s) in rows.enumerate() {
             let from = r.lines.len();
-            let (style, marker) = if i == current {
-                (Style::new().fg(Color::Yellow), format!("{} › ", k + 1))
+            let (this, target) = if k < suggestions.len() {
+                (Step::Suggestion { stop: i, n: k }, Target::Suggestion(i, s.to_string()))
             } else {
-                (Style::new().dim(), "  › ".to_string())
+                (Step::Ask(i), Target::Ask(i))
             };
+            let arrow = if step == Some(this) { "▶" } else { "›" };
+            let (mut style, marker) = if i == current {
+                (Style::new().fg(Color::Yellow), format!("{} {arrow} ", k + 1))
+            } else {
+                (Style::new().dim(), format!("  {arrow} "))
+            };
+            if this == Step::Ask(i) {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if step == Some(this) {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            steps.push((this, from));
             r.text(s, style, &marker, "    ");
             for line in from..r.lines.len() {
-                spots.push(DocSpot { line, cols: 0..width, target: Target::Suggestion(i, s.clone()) });
+                spots.push(DocSpot { line, cols: 0..width, target: target.clone() });
             }
         }
         if let Some(input) = view.input.as_ref().filter(|input| input.stop == i) {
@@ -323,6 +357,27 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
             doc.link_lines.push(s.line);
         }
     }
+    // Code references are steps, except a header anchor that the stop cites again further down.
+    for (i, (links, header)) in stop_links.iter().enumerate() {
+        let cited_below = |l: usize| r.links[links.start + header..links.end].contains(&r.links[l]);
+        let mut any = false;
+        for (n, l) in links.clone().enumerate() {
+            if n < *header && cited_below(l) {
+                continue;
+            }
+            if let Some(&line) = doc.link_lines.get(l) {
+                steps.push((Step::Ref { stop: i, n }, line));
+                any = true;
+            }
+        }
+        if !any {
+            steps.push((Step::Stop(i), doc.stop_lines[i] + 1));
+        }
+    }
+    // In document order; a question comes before a reference on its own line.
+    steps.sort_by_key(|&(step, line)| (line, !matches!(step, Step::Answer(..))));
+    doc.steps = steps;
+    doc.stop_links = stop_links.into_iter().map(|(links, _)| links).collect();
     doc.links = r.links;
     doc.len = r.lines.len();
     (r.lines, doc, spots)
@@ -341,7 +396,7 @@ fn excerpt_lines(view: &mut TourView, stop: &Stop, width: usize) -> Vec<Line<'st
         let marks = Marks { range: Some((a.start, a.end)), ..Default::default() };
         out.extend(code_lines(file, &notes, a.start.saturating_sub(1), lines.min(MAX_LINES), width, marks));
         if lines > MAX_LINES {
-            let more = format!("  … {} more; Enter on the reference opens it", count(lines - MAX_LINES, "line"));
+            let more = format!("  … {} more; click the reference to open it", count(lines - MAX_LINES, "line"));
             out.push(Line::from(more).dim());
         }
     }
@@ -718,7 +773,7 @@ fn tour_keys(view: &TourView) -> Vec<(&'static str, &'static str)> {
         Pane::Code => {
             keys.push(("↑↓", "line"));
             keys.push(("Shift ↑↓", "select"));
-            keys.push(("?", if view.code.mark.is_some() { "ask about lines" } else { "ask about line" }));
+            keys.push(("Enter", if view.code.mark.is_some() { "ask about lines" } else { "ask about line" }));
             if view.code.mark.is_some() {
                 keys.push(("Esc", "clear selection"));
             } else if matches!(view.popup, Some(Popup::Code)) {
@@ -732,16 +787,11 @@ fn tour_keys(view: &TourView) -> Vec<(&'static str, &'static str)> {
             }
         }
         Pane::Text => {
+            keys.push(("↑↓", "step"));
             keys.push(("←→", "stop"));
-            keys.push(("↑↓", "scroll"));
-            if !view.doc.links.is_empty() {
-                keys.push(("Enter", "next code ref"));
-            }
             if !view.state.tour.stops.is_empty() {
-                keys.push(("?", "ask"));
-            }
-            if view.state.tour.stops.get(view.current).is_some_and(|s| !s.suggestions().is_empty()) {
-                keys.push(("1-3", "suggested"));
+                let suggestion = matches!(view.step, Some(Step::Suggestion { .. }));
+                keys.push(("Enter", if suggestion { "ask this" } else { "ask" }));
             }
             if view.code.shown != Shown::Follow {
                 keys.push(("Esc", "follow the text"));
@@ -776,6 +826,40 @@ mod tests {
         assert!(text[1].starts_with("2▌    b();  ◂ a much") && text[1].ends_with('…'), "{text:?}");
         assert_eq!(text[2], "3▌}");
         assert!(text.iter().all(|l| display_width(l) <= 30), "{text:?}");
+    }
+
+    #[test]
+    fn down_steps_through_refs_questions_and_suggestions() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let tour = r#"{"version":1,"root":"","title":"T","summary":"S","stops":[
+            {"title":"A","body":"See [a.rs:1-2] and [b.rs:3-4].","anchors":[{"path":"a.rs","start":1,"end":2}],
+             "suggested":["Why?"],"thread":[{"q":"Q1","a":"Look at [c.rs:1-1]."}]},
+            {"title":"B","body":"No code here."}]}"#;
+        let mut view = TourView::new(".".into(), Agent::Claude);
+        view.state.tour = serde_json::from_str(tour).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        let mut walked = vec![];
+        for _ in 0..8 {
+            term.draw(|f| draw_tour(f, &mut view, f.area())).unwrap();
+            view.on_key(KeyEvent::from(KeyCode::Down));
+            walked.push(view.step.unwrap());
+        }
+        use Step::*;
+        assert_eq!(
+            walked,
+            // The header's a.rs anchor is skipped: the text cites it again.
+            [
+                Ref { stop: 0, n: 1 },
+                Ref { stop: 0, n: 2 },
+                Answer(0, 0),
+                Ref { stop: 0, n: 3 },
+                Suggestion { stop: 0, n: 0 },
+                Ask(0),
+                Stop(1),
+                Ask(1),
+            ]
+        );
+        assert_eq!(view.code.shown, Shown::Follow);
     }
 
     #[test]

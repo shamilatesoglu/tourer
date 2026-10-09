@@ -163,12 +163,38 @@ pub enum Item {
     Answer(usize, usize),
 }
 
+/// A place ↑ and ↓ move between in the text, in document order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Step {
+    /// The `n`-th code reference in a stop's part of the document.
+    Ref { stop: usize, n: usize },
+    /// A stop without code references.
+    Stop(usize),
+    /// A question asked at a stop, with its answer.
+    Answer(usize, usize),
+    /// The `n`-th suggested question at a stop.
+    Suggestion { stop: usize, n: usize },
+    /// The row for asking a question of one's own at a stop.
+    Ask(usize),
+}
+
+impl Step {
+    pub fn stop(self) -> usize {
+        match self {
+            Step::Ref { stop, .. } | Step::Suggestion { stop, .. } => stop,
+            Step::Stop(stop) | Step::Answer(stop, _) | Step::Ask(stop) => stop,
+        }
+    }
+}
+
 /// Something clickable in the text pane.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
     Link(usize),
     /// A suggested question at a stop.
     Suggestion(usize, String),
+    /// The row for asking a question of one's own at a stop.
+    Ask(usize),
     Stop(usize),
 }
 
@@ -180,6 +206,10 @@ pub struct Doc {
     pub link_lines: Vec<usize>,
     /// The document line each stop starts at.
     pub stop_lines: Vec<usize>,
+    /// The links in each stop's part of the document.
+    pub stop_links: Vec<Range<usize>>,
+    /// The steps, in order, with their document lines.
+    pub steps: Vec<(Step, usize)>,
     pub items: Vec<(Range<usize>, Item)>,
     /// Lines in the document, and in the text pane.
     pub len: usize,
@@ -231,6 +261,8 @@ pub struct TourView {
     pub jump: Option<usize>,
     /// Keep the end of this stop's answers in view while they arrive.
     pub follow: Option<usize>,
+    /// Where ↑ and ↓ have moved to; `None` after scrolling by hand.
+    pub step: Option<Step>,
     pub doc: Doc,
     pub areas: Areas,
     pub hover: Option<Position>,
@@ -271,6 +303,7 @@ impl TourView {
             current: 0,
             jump: None,
             follow: None,
+            step: None,
             doc: Doc::default(),
             areas: Areas::default(),
             hover: None,
@@ -348,6 +381,7 @@ impl TourView {
             self.current = i;
             self.code.shown = Shown::Follow;
             self.follow = None;
+            self.step = None;
         }
     }
 
@@ -356,6 +390,7 @@ impl TourView {
         self.text.by(lines);
         self.follow = None;
         self.jump = None;
+        self.step = None;
         if let Shown::Ref(_) = self.code.shown {
             self.code.shown = Shown::Follow;
         }
@@ -364,6 +399,9 @@ impl TourView {
     /// Shows a code reference from the text: in the code pane, or in a popup when narrow.
     fn open_link(&mut self, i: usize) {
         let Some(anchor) = self.doc.links.get(i).cloned() else { return };
+        if let Some(stop) = self.doc.stop_links.iter().position(|r| r.contains(&i)) {
+            self.step = Some(Step::Ref { stop, n: i - self.doc.stop_links[stop].start });
+        }
         self.code.shown = Shown::Ref(anchor);
         if !self.wide {
             self.popup = Some(Popup::Code);
@@ -371,25 +409,68 @@ impl TourView {
         }
     }
 
-    /// Picks the code reference after the one shown, scrolling the text to it if needed.
-    fn next_link(&mut self) {
-        let n = self.doc.links.len();
-        if n == 0 {
-            return;
+    /// The document link a code reference step points at.
+    pub fn step_link(&self, step: Step) -> Option<usize> {
+        match step {
+            Step::Ref { stop, n } => Some(self.doc.stop_links.get(stop)?.start + n),
+            _ => None,
         }
-        let shown = match &self.code.shown {
-            Shown::Ref(a) => Some(a.clone()),
-            _ => self.followed_ref(),
+    }
+
+    /// Moves to the next step, or the previous one. After scrolling by hand, starts from the
+    /// first step on screen.
+    fn step_by(&mut self, forward: bool) {
+        let steps = &self.doc.steps;
+        let at = self.step.and_then(|step| steps.iter().position(|(s, _)| *s == step));
+        let i = match at {
+            Some(i) if forward => i + 1,
+            Some(i) => i.saturating_sub(1),
+            None => steps.iter().position(|&(_, line)| line >= self.text.target()).unwrap_or(steps.len()),
         };
-        let top = self.text.top();
-        let current = (0..n).find(|&i| Some(&self.doc.links[i]) == shown.as_ref() && self.doc.link_lines[i] >= top);
-        let first_on_screen = || (0..n).find(|&i| self.doc.link_lines[i] >= top).unwrap_or(0);
-        let next = current.map_or_else(first_on_screen, |i| (i + 1) % n);
-        let line = self.doc.link_lines[next];
-        if !(top..top + self.doc.height).contains(&line) {
-            self.text.to(line.saturating_sub(self.doc.height / 3));
+        if let Some(&(step, _)) = steps.get(i.min(steps.len().saturating_sub(1))) {
+            self.set_step(step);
         }
-        self.open_link(next);
+    }
+
+    /// Moves to a step: scrolls the text to it and shows its code.
+    fn set_step(&mut self, step: Step) {
+        let Some(&(_, line)) = self.doc.steps.iter().find(|(s, _)| *s == step) else { return };
+        let height = self.doc.height;
+        let top = self.text.target();
+        let stop_line = self.doc.stop_lines.get(step.stop()).copied().unwrap_or(0);
+        // A stop is entered at its top, so its text is read before its code.
+        if step.stop() != self.current && line + 3 < stop_line + height {
+            self.text.to(stop_line);
+        } else if !(top + 1..top + height.saturating_sub(2)).contains(&line) {
+            self.text.to(line.saturating_sub(height / 3));
+        }
+        self.step = Some(step);
+        self.current = step.stop();
+        self.follow = None;
+        self.jump = None;
+        match step {
+            Step::Ref { .. } if self.wide => {
+                if let Some(anchor) = self.step_link(step).and_then(|i| self.doc.links.get(i)) {
+                    self.code.shown = Shown::Ref(anchor.clone());
+                }
+            }
+            Step::Stop(_) => self.code.shown = Shown::Follow,
+            _ => {}
+        }
+    }
+
+    /// Enter in the text: asks the selected suggestion, or opens the question box.
+    fn enter(&mut self) -> Option<Action> {
+        match self.step {
+            Some(Step::Suggestion { stop, n }) => {
+                let q = self.state.tour.stops.get(stop)?.suggestions().get(n)?.clone();
+                self.ask(q, stop, None)
+            }
+            _ => {
+                self.start_input();
+                None
+            }
+        }
     }
 
     fn open_file(&mut self, path: String) {
@@ -414,6 +495,7 @@ impl TourView {
             return None;
         }
         self.follow = Some(stop);
+        self.step = Some(Step::Answer(stop, self.state.tour.stops[stop].thread.len()));
         Some(Action::Ask { stop, question, code })
     }
 
@@ -503,11 +585,9 @@ impl TourView {
             (KeyCode::Char('q'), _) => return Some(Action::Quit),
             (KeyCode::Right, _) => self.go_to_stop(self.current + 1),
             (KeyCode::Left, _) => self.go_to_stop(self.current.saturating_sub(1)),
-            (KeyCode::Down, Pane::Text) => self.scroll_text(1),
-            (KeyCode::Up, Pane::Text) => self.scroll_text(-1),
-            (KeyCode::PageDown, Pane::Text) | (KeyCode::Char(' '), Pane::Text) => {
-                self.scroll_text(page(self.doc.height))
-            }
+            (KeyCode::Down | KeyCode::Char(' '), Pane::Text) => self.step_by(true),
+            (KeyCode::Up, Pane::Text) => self.step_by(false),
+            (KeyCode::PageDown, Pane::Text) => self.scroll_text(page(self.doc.height)),
             (KeyCode::PageUp, Pane::Text) => self.scroll_text(-page(self.doc.height)),
             (KeyCode::Home, Pane::Text) => self.scroll_text(isize::MIN / 2),
             (KeyCode::End, Pane::Text) => self.scroll_text(isize::MAX / 2),
@@ -520,7 +600,8 @@ impl TourView {
             (KeyCode::Tab | KeyCode::BackTab, _) if self.wide => {
                 self.focus = if self.focus == Pane::Text { Pane::Code } else { Pane::Text };
             }
-            (KeyCode::Enter, Pane::Text) => self.next_link(),
+            (KeyCode::Enter, Pane::Text) => return self.enter(),
+            (KeyCode::Enter, Pane::Code) => self.start_input(),
             (KeyCode::Esc, _) => {
                 if self.code.mark.is_some() {
                     self.code.mark = None;
@@ -531,7 +612,7 @@ impl TourView {
                 }
             }
             (KeyCode::Char('z'), _) if self.wide => self.zoomed = !self.zoomed,
-            (KeyCode::Char('?'), _) => self.start_input(),
+            (KeyCode::Char('?') | KeyCode::Char('4'), _) => self.start_input(),
             (KeyCode::Char('o'), _) => self.popup = Some(Popup::Outline { sel: self.current }),
             (KeyCode::Char('f'), _) => self.popup = Some(Popup::Files { query: String::new(), sel: 0 }),
             (KeyCode::Char(c @ '1'..='3'), _) => {
@@ -561,6 +642,11 @@ impl TourView {
                     match target.clone() {
                         Target::Link(i) => self.open_link(i),
                         Target::Suggestion(stop, q) => return self.ask(q, stop, None),
+                        Target::Ask(stop) => {
+                            self.current = stop;
+                            self.step = Some(Step::Ask(stop));
+                            self.start_input();
+                        }
                         Target::Stop(i) => self.go_to_stop(i),
                     }
                     return None;

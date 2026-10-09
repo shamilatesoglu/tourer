@@ -50,7 +50,10 @@ in the background, plans the tour as a series of stops, and answers questions at
   on screen. Scrolling glides, stops have a progress line on top, questions are typed inline,
   and popups show notes, the list of stops and a file picker. Under 100 columns the code goes
   inline under each stop and opens in a popup. Keys are few and arrow-based, and the bottom bar
-  shows the ones that work right now. `view.rs` holds the tour screen's state and input,
+  shows the ones that work right now. ↑/↓ walk the tour step by step rather than scroll: each
+  code reference (a header anchor the text cites again is skipped), each question, each
+  suggested question, then an "Ask a different question" row; entering a stop shows its top
+  first. Scrolling by hand drops the step, and the next ↓ starts from the screen. `view.rs` holds the tour screen's state and input,
   `ui.rs` draws it.
 - Line notes: the planner gives each stop notes on single lines, and the guide can add some after
   `<<notes>>`. The code pane shows a note after its line, cut to fit, and the whole note in a
@@ -65,15 +68,16 @@ in the background, plans the tour as a series of stops, and answers questions at
 - `cargo run -- <folder> [--agent claude|codex] [--model NAME] [--out tour.json] [--replan]` (needs
   the agent's CLI on PATH and logged in). `--agent`, `--model` and `--replan` preselect the start
   screen; the agent and model picked there are saved in `prefs.json` next to the tours.
-- Keys: `←`/`→` change stop, `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the text or move the code
-  cursor, `Shift`+`↑`/`↓` select code lines, `Tab` switch pane, `Enter` (in the text) show the
-  next code reference, `?` ask (about the selected lines in the code pane), `1`–`3` ask a
-  suggested question, `o` list of stops, `f` open any file, `z` zoom, `Esc` back, `q` quit.
-- Mouse: click a reference, suggestion or progress mark; click or drag in the code to select
+- Keys: `↑`/`↓` (or `Space`) step through the text, or move the code cursor; `←`/`→` change
+  stop; `PgUp`/`PgDn`/`Home`/`End` scroll; `Shift`+`↑`/`↓` select code lines; `Tab` switch pane;
+  `Enter` ask the selected suggestion, or ask your own question (about the selected lines in
+  the code pane); `1`–`4` pick a suggestion row (`?` also asks); `o` list of stops; `f` open
+  any file; `z` zoom; `Esc` back; `q` quit.
+- Mouse: click a reference, suggestion, the ask row or a progress mark; click or drag in the code to select
   lines; hover a noted line for its note; drag the border to resize; the wheel scrolls.
 - Daemon log: `daemon.log` next to the saved tours.
 - MCP: `tourer --mcp [--agent codex] [default-folder]` (default agent: the last one picked), e.g. `claude mcp add tourer -- /path/to/tourer --mcp`.
   Tool calls take an optional `path`, and each folder's tour is planned once and shared.
 - `cargo test` covers markdown rendering (tables, link positions), line notes in the code pane,
-  smooth scrolling, decoding codex events, unseen-update tracking, and parsing of planner
+  smooth scrolling, the order ↓ steps through, decoding codex events, unseen-update tracking, and parsing of planner
   lines, updates, answers and code references.
