@@ -76,6 +76,7 @@ in the background, plans the tour as a series of stops, and answers questions at
 - Mouse: click a reference, suggestion, the ask row or a progress mark; click or drag in the code to select
   lines; hover a noted line for its note; drag the border to resize; the wheel scrolls.
 - Daemon log: `daemon.log` next to the saved tours.
+- Demo: `vhs demo/tourer.tape` records the README's `docs/demo.gif`; the tape says how to prepare it.
 - MCP: `tourer --mcp [--agent codex] [default-folder]` (default agent: the last one picked), e.g. `claude mcp add tourer -- /path/to/tourer --mcp`.
   Tool calls take an optional `path`, and each folder's tour is planned once and shared.
 - `cargo test` covers markdown rendering (tables, link positions), line notes in the code pane,

@@ -2,6 +2,14 @@
 name = "tourer"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Guided, AI-planned tours of unfamiliar folders and codebases, in the terminal and over MCP"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shamilatesoglu/tourer"
+readme = "README.md"
+keywords = ["tui", "codebase", "onboarding", "mcp", "ai"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/docs", "/demo", "AGENTS.md", "CLAUDE.md"]
 
 [dependencies]
 anyhow = "1.0.104"
