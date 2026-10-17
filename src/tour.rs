@@ -9,6 +9,9 @@ pub struct Tour {
     pub root: String,
     pub title: String,
     pub summary: String,
+    /// What the person asked of the tour before it was planned, if anything.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instructions: String,
     pub stops: Vec<Stop>,
     /// The guide's conversation, kept so it can be continued after a restart.
     #[serde(default)]

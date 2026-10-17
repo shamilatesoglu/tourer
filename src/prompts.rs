@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use crate::tour::{Anchor, Stop};
+use crate::tour::{Anchor, Stop, Tour};
 
 pub const PLANNER: &str = r#"You are the planner for tourer, a tool that gives guided tours of a folder or codebase to someone (a person or an AI agent) who has never seen it. The working directory is the folder to tour. Explore it with your read-only tools and write the tour.
 
@@ -28,7 +28,14 @@ How to build a good tour:
 - suggested: 2 or 3 questions a newcomer would likely ask next at this stop, answerable from the code.
 "#;
 
-pub const PLANNER_START: &str = "Plan the tour of this folder.";
+/// The planner's first message, with the person's instructions for the tour if they gave any.
+pub fn planner_start(instructions: &str) -> String {
+    let mut s = String::from("Plan the tour of this folder.");
+    if !instructions.trim().is_empty() {
+        let _ = write!(s, " The person gave these instructions for the tour; follow them:\n\n{}", instructions.trim());
+    }
+    s
+}
 
 /// Sent when the planner ends its turn before writing the done line.
 pub fn planner_continue(stops: usize) -> String {
@@ -37,7 +44,7 @@ pub fn planner_continue(stops: usize) -> String {
 
 pub const GUIDE: &str = r#"You are the guide in tourer, a tool that gives guided tours of a folder or codebase to someone (a person or an AI agent) who has never seen it. The working directory is that folder. A separate planner wrote the tour's stops; you answer the questions asked along the way.
 
-Messages start with a bracketed context block: stops that are new or changed since your last message (all of them in your first message), then which stop the person is at and the question's number there, and sometimes code they selected. Questions may be about that stop or about anything else in the folder.
+Messages start with a bracketed context block: in your first message, the person's instructions for the tour if they gave any; stops that are new or changed since your last message (all of them in your first message), then which stop the person is at and the question's number there, and sometimes code they selected. Questions may be about that stop or about anything else in the folder.
 
 - Ground every answer in the actual files: read and search instead of guessing. If something is not in the folder, say so.
 - Be concise: usually under 200 words of markdown. Lead with the direct answer.
@@ -50,29 +57,49 @@ Messages start with a bracketed context block: stops that are new or changed sin
 - End every answer with a line containing exactly <<next>> followed by 2 or 3 short follow-up questions they would likely want to ask next, one per line.
 "#;
 
-/// A question for the guide. `changed` are the stops (0-based, with their text) the guide has
-/// not seen in their current form; `code` is the selected code with its lines.
+/// A question for the guide: question `e` at stop `s` (both 0-based). A new conversation
+/// (`fresh`) is told the person's instructions for the tour; `changed` are the stops the guide
+/// has not seen in their current form; `code` is the selected code with its lines.
 pub fn question(
+    tour: &Tour,
+    (s, e): (usize, usize),
+    fresh: bool,
     changed: &[(usize, &Stop)],
-    stop_no: usize,
-    stop_count: usize,
-    question_no: usize,
-    stop: &Stop,
     code: Option<(&Anchor, &str)>,
-    q: &str,
 ) -> String {
-    let mut s = String::from("[");
+    let stop = &tour.stops[s];
+    let mut m = String::from("[");
+    let instructions = tour.instructions.trim();
+    if fresh && !instructions.is_empty() {
+        let _ = writeln!(m, "The person gave these instructions for the tour; keep to them:\n{instructions}\n");
+    }
     if !changed.is_empty() {
-        s.push_str("Stops new or changed since your last message:\n");
+        m.push_str("Stops new or changed since your last message:\n");
         for (i, stop) in changed {
             let anchors: Vec<String> = stop.anchors.iter().map(|a| a.to_string()).collect();
-            let _ = writeln!(s, "Stop {}: \"{}\". Anchors: {}.\n{}\n", i + 1, stop.title, anchors.join(", "), stop.body);
+            let _ = writeln!(m, "Stop {}: \"{}\". Anchors: {}.\n{}\n", i + 1, stop.title, anchors.join(", "), stop.body);
         }
     }
-    let _ = write!(s, "Question {question_no} at stop {stop_no}/{stop_count}: \"{}\".", stop.title);
+    let _ = write!(m, "Question {} at stop {}/{}: \"{}\".", e + 1, s + 1, tour.stops.len(), stop.title);
     if let Some((anchor, lines)) = code {
-        let _ = write!(s, "\nThey selected {anchor}:\n```\n{lines}\n```");
+        let _ = write!(m, "\nThey selected {anchor}:\n```\n{lines}\n```");
     }
-    let _ = write!(s, "]\n\n{q}");
-    s
+    let _ = write!(m, "]\n\n{}", stop.thread[e].q);
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passes_instructions_to_the_planner_and_a_new_guide() {
+        assert_eq!(planner_start("  "), "Plan the tour of this folder.");
+        assert!(planner_start("focus on the parser").ends_with("\n\nfocus on the parser"));
+        let tour = r#"{"version":1,"root":"","title":"T","summary":"S","instructions":"answer in Turkish",
+            "stops":[{"title":"A","body":"b","thread":[{"q":"why?","a":""}]}]}"#;
+        let tour: Tour = serde_json::from_str(tour).unwrap();
+        assert!(question(&tour, (0, 0), true, &[], None).contains("answer in Turkish"));
+        assert!(!question(&tour, (0, 0), false, &[], None).contains("answer in Turkish"));
+    }
 }

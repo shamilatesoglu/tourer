@@ -36,8 +36,9 @@ pub enum Request {
     Hello { token: String, build: String },
     /// Lists a folder's tours, answered with [`Reply::Tours`].
     List { root: PathBuf },
-    /// Opens a folder's tour and sends its state now and whenever it changes.
-    Open { root: PathBuf, agent: Agent, model: Option<String>, replan: bool },
+    /// Opens a folder's tour and sends its state now and whenever it changes. A replan follows
+    /// `instructions`.
+    Open { root: PathBuf, agent: Agent, model: Option<String>, replan: bool, instructions: String },
     /// Asks a question at a stop, optionally about some lines of code.
     Ask { root: PathBuf, agent: Agent, stop: usize, question: String, code: Option<Anchor> },
     /// The person saw a stop, or one of its answers, at this revision.
@@ -63,6 +64,7 @@ pub enum Reply {
 pub struct TourSummary {
     pub agent: Agent,
     pub title: String,
+    pub instructions: String,
     pub stops: usize,
     pub questions: usize,
     pub planning: bool,
@@ -73,6 +75,7 @@ impl TourSummary {
         TourSummary {
             agent,
             title: tour.title.clone(),
+            instructions: tour.instructions.clone(),
             stops: tour.stops.len(),
             questions: tour.stops.iter().map(|s| s.thread.len()).sum(),
             planning,
@@ -368,10 +371,10 @@ impl Daemon {
                 let tours = self.list(&root);
                 write_line(&mut *out.lock().unwrap(), &Reply::Tours { root, tours })?;
             }
-            Request::Open { root, agent, model, replan } => {
+            Request::Open { root, agent, model, replan, instructions } => {
                 let shared = self.tour(&root, agent, model)?;
                 if replan {
-                    shared.update(|e| e.replan())?;
+                    shared.update(|e| e.replan(instructions))?;
                 }
                 let (out, connected) = (out.clone(), connected.clone());
                 thread::spawn(move || watch(&shared, &root, &out, &connected));

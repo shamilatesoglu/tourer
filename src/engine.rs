@@ -126,7 +126,7 @@ impl Engine {
                 }
                 engine.next_question();
             }
-            None => engine.plan()?,
+            None => engine.plan(String::new())?,
         }
         Ok(engine)
     }
@@ -135,13 +135,13 @@ impl Engine {
         &self.root
     }
 
-    /// Throws the tour away, questions included, and plans a new one.
-    pub fn replan(&mut self) -> Result<()> {
+    /// Throws the tour away, questions included, and plans a new one, following `instructions`.
+    pub fn replan(&mut self, instructions: String) -> Result<()> {
         self.stop_agents();
         self.generation += 1;
         self.plan_buf.clear();
         self.state = State::default();
-        self.plan()
+        self.plan(instructions)
     }
 
     /// Ends the agent processes.
@@ -155,13 +155,14 @@ impl Engine {
         self.state.planning || self.state.is_answering()
     }
 
-    fn plan(&mut self) -> Result<()> {
-        self.state.tour = Tour { version: 1, root: self.root.display().to_string(), ..Default::default() };
+    fn plan(&mut self, instructions: String) -> Result<()> {
+        let root = self.root.display().to_string();
+        self.state.tour = Tour { version: 1, root, instructions, ..Default::default() };
         self.state.planning = true;
         self.state.planner_activity = "starting".into();
         (self.plan_done, self.plan_continues) = (false, 0);
         let mut planner = self.spawn(Role::Planner)?;
-        planner.send(prompts::PLANNER_START)?;
+        planner.send(&prompts::planner_start(&self.state.tour.instructions))?;
         self.planner = Some(planner);
         Ok(())
     }
@@ -432,7 +433,8 @@ impl Engine {
         let ex = &stop.thread[e];
         let lines = ex.code.as_ref().map(|a| self.lines(a));
         let code = ex.code.as_ref().zip(lines.as_deref());
-        prompts::question(&changed, s + 1, tour.stops.len(), e + 1, stop, code, &ex.q)
+        // A new conversation has seen no stops yet.
+        prompts::question(tour, (s, e), known.is_empty(), &changed, code)
     }
 
     /// The text of an anchor's lines, at most 200 of them.

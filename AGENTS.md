@@ -36,6 +36,8 @@ in the background, plans the tour as a series of stops, and answers questions at
     continued, a new one starts and gets the whole tour. Token use and cache hits per turn go
     to the daemon log.
 - The planner and the guide are two separate agent sessions, so planning never blocks questions.
+- A new tour can be given instructions (what to focus on, how to explain). They are saved with
+  the tour, sent to the planner, and given to the guide at the start of each conversation.
 - The planner ends the tour with a `done` line. An agent's turn ends whenever it replies without
   a tool call, so a planner can stop early; if its turn ends without the done line, it is asked to
   continue, up to 3 times. The daemon log says why each turn ended.
@@ -48,7 +50,7 @@ in the background, plans the tour as a series of stops, and answers questions at
   `$XDG_STATE_HOME/tourer`), continues saved tours, and exits after 10 idle minutes. Front-ends
   talk to it over localhost TCP with a token, one JSON message per line. A front-end built
   differently from the running daemon starts a new one.
-- TUI: a start screen (continue the tour, plan a new one, guide, model), then the tour: one
+- TUI: a start screen (continue the tour, plan a new one, instructions for it, guide, model), then the tour: one
   scrolling document of all stops beside the code pane, which follows the first code reference
   on screen. Scrolling glides, stops have a progress line on top, questions are typed inline,
   and popups show notes, the list of stops and a file picker. Under 100 columns the code goes

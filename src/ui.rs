@@ -86,6 +86,16 @@ fn draw_start(f: &mut Frame, start: &mut Start, root: &str, area: Rect) {
             lines.push((Some(Row::New), Line::from(new)));
         }
     }
+    if start.tours.is_some() {
+        let room = (width as usize).saturating_sub(18);
+        let text = match (start.instructions.is_empty(), row == Row::Instructions) {
+            (true, false) => Span::from("none, e.g. focus on the parser").dim(),
+            (true, true) => Span::from("▏type what the tour should focus on or how to explain").dim(),
+            (false, true) => Span::from(format!("{}▏", left_cut(&start.instructions, room))),
+            (false, false) => Span::from(left_cut(&start.instructions, room + 1)),
+        };
+        lines.push((Some(Row::Instructions), Line::from(vec![label(Row::Instructions, "Instructions"), text])));
+    }
     lines.push((None, Line::from("")));
     let mut agents = vec![label(Row::Agent, "Guide")];
     for agent in Agent::ALL {
@@ -749,10 +759,11 @@ fn start_keys(start: &Start) -> Vec<(&'static str, &'static str)> {
     match start.row() {
         Row::Agent => keys.push(("←→", "change guide")),
         Row::Model => keys.push(("type", "a model name, empty for the default")),
+        Row::Instructions => keys.push(("type", "what the new tour should focus on")),
         Row::Continue | Row::New => {}
     }
-    keys.push(("Enter", "start"));
-    if start.row() != Row::Model {
+    keys.push(("Enter", if start.row() == Row::Instructions { "plan with them" } else { "start" }));
+    if !matches!(start.row(), Row::Model | Row::Instructions) {
         keys.push(("q", "quit"));
     }
     keys

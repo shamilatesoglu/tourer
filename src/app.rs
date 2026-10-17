@@ -30,7 +30,7 @@ pub enum Screen {
 /// What a screen asks the app to do after a key or a click.
 pub enum Action {
     Quit,
-    Start { agent: Agent, model: Option<String>, replan: bool },
+    Start { agent: Agent, model: Option<String>, replan: bool, instructions: String },
     Ask { stop: usize, question: String, code: Option<Anchor> },
 }
 
@@ -78,7 +78,7 @@ impl App {
         match action {
             None => {}
             Some(Action::Quit) => self.quit = true,
-            Some(Action::Start { agent, model, replan }) => {
+            Some(Action::Start { agent, model, replan, instructions }) => {
                 self.prefs.agent = agent;
                 match &model {
                     Some(model) => self.prefs.models.insert(agent, model.clone()),
@@ -87,7 +87,7 @@ impl App {
                 if let Err(err) = self.prefs.save() {
                     self.error = Some(format!("cannot save preferences: {err:#}"));
                 }
-                let request = Request::Open { root: self.root.clone(), agent, model, replan };
+                let request = Request::Open { root: self.root.clone(), agent, model, replan, instructions };
                 self.send(&request);
                 self.screen = Screen::Tour(Box::new(TourView::new(self.root.clone(), agent)));
             }
@@ -140,6 +140,7 @@ impl App {
 pub enum Row {
     Continue,
     New,
+    Instructions,
     Agent,
     Model,
 }
@@ -153,6 +154,8 @@ pub struct Start {
     pub model: String,
     /// The model last picked for each agent, shown when switching to it.
     models: BTreeMap<Agent, String>,
+    /// What to ask of a new tour, filled in from the existing tour's.
+    pub instructions: String,
     row: Row,
     /// Plan anew even if a tour exists, as asked on the command line.
     replan: bool,
@@ -163,11 +166,13 @@ pub struct Start {
 impl Start {
     fn new(agent: Agent, model: String, models: BTreeMap<Agent, String>, replan: bool) -> Self {
         let installed: Vec<Agent> = Agent::ALL.into_iter().filter(|a| a.is_installed()).collect();
-        Start { tours: None, agent, installed, model, models, row: Row::New, replan, row_spots: vec![] }
+        let instructions = String::new();
+        Start { tours: None, agent, installed, model, models, instructions, row: Row::New, replan, row_spots: vec![] }
     }
 
     fn set_tours(&mut self, tours: Vec<TourSummary>) {
         self.tours = Some(tours);
+        self.instructions = self.existing().map(|t| t.instructions.clone()).unwrap_or_default();
         self.row = if self.existing().is_some() && !self.replan { Row::Continue } else { Row::New };
     }
 
@@ -178,7 +183,7 @@ impl Start {
 
     /// The rows that can be picked now. Continue needs an existing tour.
     pub fn rows(&self) -> Vec<Row> {
-        let mut rows = vec![Row::New, Row::Agent, Row::Model];
+        let mut rows = vec![Row::New, Row::Instructions, Row::Agent, Row::Model];
         if self.existing().is_some() {
             rows.insert(0, Row::Continue);
         }
@@ -206,6 +211,7 @@ impl Start {
                 if all[j] != self.agent {
                     self.agent = all[j];
                     self.model = self.models.get(&self.agent).cloned().unwrap_or_default();
+                    self.instructions = self.existing().map(|t| t.instructions.clone()).unwrap_or_default();
                 }
                 break;
             }
@@ -215,17 +221,19 @@ impl Start {
         }
     }
 
-    /// Starts the tour: continues it on Continue, else plans a new one, replacing any old one.
+    /// Starts the tour: continues it on Continue, plans a new one on New or Instructions,
+    /// replacing any old one.
     fn start(&self, row: Row) -> Option<Action> {
         self.tours.as_ref()?;
         let replan = match row {
             Row::Continue => false,
-            Row::New => true,
+            Row::New | Row::Instructions => true,
             Row::Agent | Row::Model => self.replan || self.existing().is_none(),
         };
         let model = self.model.trim();
         let model = (!model.is_empty()).then(|| model.to_string());
-        Some(Action::Start { agent: self.agent, model, replan })
+        let instructions = self.instructions.trim().to_string();
+        Some(Action::Start { agent: self.agent, model, replan, instructions })
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -239,6 +247,10 @@ impl Start {
                 self.model.pop();
             }
             (KeyCode::Char(c), Row::Model) => self.model.push(c),
+            (KeyCode::Backspace, Row::Instructions) => {
+                self.instructions.pop();
+            }
+            (KeyCode::Char(c), Row::Instructions) => self.instructions.push(c),
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => return Some(Action::Quit),
             _ => {}
         }
@@ -253,7 +265,7 @@ impl Start {
         match row {
             Row::Continue | Row::New => return self.start(row),
             Row::Agent => self.cycle_agent(true),
-            Row::Model => {}
+            Row::Instructions | Row::Model => {}
         }
         None
     }
