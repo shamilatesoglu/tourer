@@ -240,7 +240,7 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
     let unseen = Span::from(" ✦").yellow().bold();
     // Steps other than code references, found while rendering.
     let mut steps: Vec<(Step, usize)> = vec![];
-    // Per stop: its links, and how many of them are in the header's list of anchors.
+    // Per stop: the range of its links.
     let mut stop_links = vec![];
 
     if !state.tour.title.is_empty() {
@@ -263,13 +263,18 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
             header.push(unseen.clone());
         }
         r.lines.push(Line::from(header));
-        let anchors: Vec<String> = stop.anchors.iter().map(|a| a.to_string()).collect();
-        if !anchors.is_empty() {
-            r.text(&anchors.join(" "), Style::new(), "", "");
-        }
-        let header_links = r.links.len() - first_link;
         r.blank();
         r.markdown(&stop.body, "");
+        // Anchors belong where the text cites them; any it leaves out are listed after it.
+        let cited = tour::refs(&stop.body);
+        let uncited: Vec<String> = (stop.anchors.iter())
+            .filter(|a| !cited.iter().any(|(_, c)| c.path == a.path && c.start <= a.end && a.start <= c.end))
+            .map(|a| a.to_string())
+            .collect();
+        if !uncited.is_empty() {
+            r.blank();
+            r.text(&format!("See also {}", uncited.join(" ")), Style::new().dim(), "", "");
+        }
         if let Some(lines) = excerpts.get(i) {
             r.lines.extend(lines.iter().cloned());
         }
@@ -300,7 +305,7 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
             doc.items.push((start..r.lines.len(), Item::Answer(i, e)));
         }
         doc.thread_ends.push(r.lines.len());
-        stop_links.push((first_link..r.links.len(), header_links));
+        stop_links.push(first_link..r.links.len());
 
         // Every stop shows its suggestions, so the layout does not shift as the current stop
         // changes; the current stop's stand out, and only they have number keys. The last row
@@ -357,14 +362,10 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
             doc.link_lines.push(s.line);
         }
     }
-    // Code references are steps, except a header anchor that the stop cites again further down.
-    for (i, (links, header)) in stop_links.iter().enumerate() {
-        let cited_below = |l: usize| r.links[links.start + header..links.end].contains(&r.links[l]);
+    // Code references are steps; a stop without any is one step itself.
+    for (i, links) in stop_links.iter().enumerate() {
         let mut any = false;
         for (n, l) in links.clone().enumerate() {
-            if n < *header && cited_below(l) {
-                continue;
-            }
             if let Some(&line) = doc.link_lines.get(l) {
                 steps.push((Step::Ref { stop: i, n }, line));
                 any = true;
@@ -377,7 +378,7 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
     // In document order; a question comes before a reference on its own line.
     steps.sort_by_key(|&(step, line)| (line, !matches!(step, Step::Answer(..))));
     doc.steps = steps;
-    doc.stop_links = stop_links.into_iter().map(|(links, _)| links).collect();
+    doc.stop_links = stop_links;
     doc.links = r.links;
     doc.len = r.lines.len();
     (r.lines, doc, spots)
@@ -832,14 +833,14 @@ mod tests {
     fn down_steps_through_refs_questions_and_suggestions() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent};
         let tour = r#"{"version":1,"root":"","title":"T","summary":"S","stops":[
-            {"title":"A","body":"See [a.rs:1-2] and [b.rs:3-4].","anchors":[{"path":"a.rs","start":1,"end":2}],
+            {"title":"A","body":"See [a.rs:1-2] and [b.rs:3-4].","anchors":[{"path":"a.rs","start":1,"end":2},{"path":"d.rs","start":5,"end":9}],
              "suggested":["Why?"],"thread":[{"q":"Q1","a":"Look at [c.rs:1-1]."}]},
             {"title":"B","body":"No code here."}]}"#;
         let mut view = TourView::new(".".into(), Agent::Claude);
         view.state.tour = serde_json::from_str(tour).unwrap();
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
         let mut walked = vec![];
-        for _ in 0..8 {
+        for _ in 0..9 {
             term.draw(|f| draw_tour(f, &mut view, f.area())).unwrap();
             view.on_key(KeyEvent::from(KeyCode::Down));
             walked.push(view.step.unwrap());
@@ -847,8 +848,9 @@ mod tests {
         use Step::*;
         assert_eq!(
             walked,
-            // The header's a.rs anchor is skipped: the text cites it again.
+            // The text cites the a.rs anchor; the d.rs one it leaves out follows the text.
             [
+                Ref { stop: 0, n: 0 },
                 Ref { stop: 0, n: 1 },
                 Ref { stop: 0, n: 2 },
                 Answer(0, 0),

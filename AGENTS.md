@@ -12,6 +12,9 @@ in the background, plans the tour as a series of stops, and answers questions at
   - Each stop keeps its own question-and-answer thread.
   - Every question is sent with the current stop as context.
   - Answers cite code as `[path:start-end]`, and the TUI turns these into links you can jump to.
+  - A stop's anchors are not listed under its title: the body cites them where it explains
+    them, and any it leaves out follow the text as "See also". With nothing cited on screen,
+    the code pane shows the current stop's first anchor.
   - Questions can be about selected lines of code; the lines go along with the question.
   - Agents correct earlier stops and answers whenever they learn better: the planner with
     `update` lines, the guide in an `<<update>>` section. Nothing is marked as revised; the
@@ -51,8 +54,8 @@ in the background, plans the tour as a series of stops, and answers questions at
   and popups show notes, the list of stops and a file picker. Under 100 columns the code goes
   inline under each stop and opens in a popup. Keys are few and arrow-based, and the bottom bar
   shows the ones that work right now. ↑/↓ walk the tour step by step rather than scroll: each
-  code reference (a header anchor the text cites again is skipped), each question, each
-  suggested question, then an "Ask a different question" row; entering a stop shows its top
+  code reference, each question, each suggested question, then an "Ask a different question"
+  row; entering a stop shows its top
   first. Scrolling by hand drops the step, and the next ↓ starts from the screen. `view.rs` holds the tour screen's state and input,
   `ui.rs` draws it.
 - Line notes: the planner gives each stop notes on single lines, and the guide can add some after

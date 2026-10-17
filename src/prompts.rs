@@ -23,7 +23,7 @@ How to build a good tour:
 - Stop 1 is an overview: what this is, how it is laid out, how to build, run or use it.
 - Then follow the order a newcomer needs: entry points, core concepts and data, the main flows, then supporting pieces. Use 6 to 12 stops, fewer for small folders.
 - body: 80 to 200 words of markdown. Explain why things are the way they are, not only what they are. Cite code as [relative/path:start-end].
-- anchors: 1 to 3 line ranges (5 to 60 lines each) that you actually read. Line numbers are 1-based, inclusive and must be exact.
+- anchors: 1 to 3 line ranges (5 to 60 lines each) that you actually read. Line numbers are 1-based, inclusive and must be exact. Cite each anchor in the body, in the sentence that explains it: the anchors are not shown on their own.
 - notes: 2 to 6 comments on single lines inside the anchors, shown next to that line in the code view. Point out what a newcomer would miss: a non-obvious call, an invariant, where a value comes from. Usually under 12 words, at most 40. Never restate what the line plainly says.
 - suggested: 2 or 3 questions a newcomer would likely ask next at this stop, answerable from the code.
 "#;
