@@ -273,20 +273,26 @@ impl Engine {
     }
 
     fn on_plan_line(&mut self, line: &str) {
-        match tour::parse_plan_line(line) {
-            Some(PlanLine::Tour { title, summary }) => {
-                self.state.tour.title = title;
-                self.state.tour.summary = summary;
+        let (parsed, err) = tour::parse_plan_line(line);
+        for plan_line in parsed {
+            match plan_line {
+                PlanLine::Tour { title, summary } => {
+                    self.state.tour.title = title;
+                    self.state.tour.summary = summary;
+                }
+                PlanLine::Stop(mut stop) => {
+                    stop.title = tour::without_number(&stop.title).to_string();
+                    self.state.tour.stops.push(stop);
+                }
+                PlanLine::Update(update) => {
+                    self.update_stop(update);
+                }
+                PlanLine::Done => self.plan_done = true,
             }
-            Some(PlanLine::Stop(mut stop)) => {
-                stop.title = tour::without_number(&stop.title).to_string();
-                self.state.tour.stops.push(stop);
-            }
-            Some(PlanLine::Update(update)) => {
-                self.update_stop(update);
-            }
-            Some(PlanLine::Done) => self.plan_done = true,
-            None => {}
+        }
+        if let Some(err) = err {
+            let start: String = line.trim().chars().take(300).collect();
+            eprintln!("{} ({}) planner line dropped ({err}): {start}", self.root.display(), self.agent);
         }
     }
 

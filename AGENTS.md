@@ -41,7 +41,8 @@ in the background, plans the tour as a series of stops, and answers questions at
   the tour, sent to the planner, and given to the guide at the start of each conversation.
 - The planner ends the tour with a `done` line. An agent's turn ends whenever it replies without
   a tool call, so a planner can stop early; if its turn ends without the done line, it is asked to
-  continue, up to 3 times. The daemon log says why each turn ended.
+  continue, up to 3 times. The daemon log says why each turn ended and shows any planner line
+  that could not be read. Several JSON objects on one line are all read.
 - Simplicity first: no feature, crate or abstraction until it is needed. One crate for now.
 - Tour format: our own small JSON format (see `src/tour.rs`). CodeTour `.tour` export can be added later.
 - `engine.rs` owns planning and Q&A. A background daemon (`daemon.rs`) hosts one engine per folder,

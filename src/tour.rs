@@ -215,12 +215,21 @@ pub fn without_number(title: &str) -> &str {
     }
 }
 
-pub fn parse_plan_line(line: &str) -> Option<PlanLine> {
+/// The plan lines in one line of the planner's output; some models put several on one line.
+/// Text that is not JSON is skipped. Also returns why the rest of the line could not be read.
+pub fn parse_plan_line(line: &str) -> (Vec<PlanLine>, Option<serde_json::Error>) {
     let line = line.trim();
     if !line.starts_with('{') {
-        return None;
+        return (vec![], None);
     }
-    serde_json::from_str(line).ok()
+    let mut parsed = vec![];
+    for item in serde_json::Deserializer::from_str(line).into_iter() {
+        match item {
+            Ok(p) => parsed.push(p),
+            Err(err) => return (parsed, Some(err)),
+        }
+    }
+    (parsed, None)
 }
 
 /// Marker the guide puts before its line notes.
@@ -302,15 +311,19 @@ mod tests {
 
     #[test]
     fn parses_plan_lines() {
-        assert!(matches!(
-            parse_plan_line(r#"{"type":"tour","title":"T","summary":"S"}"#),
-            Some(PlanLine::Tour { .. })
-        ));
+        let one = |line| match parse_plan_line(line) {
+            (mut lines, None) if lines.len() == 1 => lines.pop().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(one(r#"{"type":"tour","title":"T","summary":"S"}"#), PlanLine::Tour { .. }));
         let stop = r#"{"type":"stop","title":"A","body":"b","anchors":[{"path":"x.rs","start":1,"end":4}],"suggested":["why?"]}"#;
-        let Some(PlanLine::Stop(s)) = parse_plan_line(stop) else { panic!() };
+        let PlanLine::Stop(s) = one(stop) else { panic!() };
         assert_eq!(s.anchors[0].end, 4);
-        assert!(parse_plan_line("Let me look around.").is_none());
-        assert!(matches!(parse_plan_line(r#"{"type":"done"}"#), Some(PlanLine::Done)));
+        assert!(matches!(parse_plan_line("Let me look around."), (lines, None) if lines.is_empty()));
+        assert!(matches!(one(r#"{"type":"done"}"#), PlanLine::Done));
+        // Several on one line, and a broken one after them.
+        let (lines, err) = parse_plan_line(r#"{"type":"tour","title":"T","summary":"S"} {"type":"done"}{"type":"stop","#);
+        assert!(matches!(lines[..], [PlanLine::Tour { .. }, PlanLine::Done]) && err.is_some());
     }
 
     #[test]
@@ -335,7 +348,7 @@ mod tests {
     #[test]
     fn parses_updates() {
         let line = r#"{"type":"update","stop":2,"body":"New text."}"#;
-        let Some(PlanLine::Update(u)) = parse_plan_line(line) else { panic!() };
+        let PlanLine::Update(u) = parse_plan_line(line).0.remove(0) else { panic!() };
         assert_eq!((u.stop, u.body.as_deref(), u.title), (2, Some("New text."), None));
         let a = split_answer(concat!(
             "Answer.\n<<update>>\n",
