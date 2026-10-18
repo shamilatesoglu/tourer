@@ -85,4 +85,4 @@ questions. Planning never blocks your questions.
 
 ## License
 
-MIT or Apache-2.0, at your option.
+MIT. See [LICENSE](LICENSE).
