@@ -70,6 +70,13 @@ in the background, plans the tour as a series of stops, and answers questions at
   and link order. Syntax highlighting uses syntect with bat's "ansi" theme (via two-face), so colors
   come from the terminal palette and work on light and dark themes.
 
+## Later
+- History tours: besides a tour of the folder as it is, a tour of how it got there. Git commits
+  are only part of it; much of a project's reasoning now lives in agent conversations (Claude
+  Code and Codex sessions: the prompts, the options weighed, the decisions made). Show that
+  development and its decisions in a way that is good to look at, not as a log. The unmerged
+  `diff-tours` branch (tour the changes since a git revision) covers the git side.
+
 ## Running
 - `cargo run -- <folder> [--agent claude|codex] [--model NAME] [--out tour.json] [--replan]` (needs
   the agent's CLI on PATH and logged in). `--agent`, `--model` and `--replan` preselect the start
