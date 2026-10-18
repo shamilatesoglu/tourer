@@ -4,8 +4,10 @@ A Rust TUI that gives guided tours of unfamiliar folders and codebases. An AI ag
 in the background, plans the tour as a series of stops, and answers questions at every stop.
 
 ## Decisions
-- Audience: humans (TUI) and other AI agents (via a protocol), both reading folders or
-  codebases they have never seen before.
+- Audience: people reading folders or codebases they have never seen before, in the TUI.
+- No MCP server (removed in October 2026). Coding agents can already explore a codebase and
+  start their own subagents, so a tour adds little for them beyond cost and latency. Bring it
+  back only for a real need, such as a person and an agent sharing one tour.
 - One-conversation model: a tour is a conversation with a guide. Stops are messages the
   guide planned in advance, and questions are messages in that same conversation.
   - You can ask at any stop, anytime, including while stops are still being generated.
@@ -18,8 +20,7 @@ in the background, plans the tour as a series of stops, and answers questions at
   - Questions can be about selected lines of code; the lines go along with the question.
   - Agents correct earlier stops and answers whenever they learn better: the planner with
     `update` lines, the guide in an `<<update>>` section. Nothing is marked as revised; the
-    TUI only shows ✦ on updates the person has not seen yet (seen = on screen for 1.5 s),
-    and MCP outlines say which stops changed since that client read them.
+    TUI only shows ✦ on updates the person has not seen yet (seen = on screen for 1.5 s).
   - Stops and answers come with 2–3 suggested follow-up questions you can pick with a key.
 - Agents: the planner and guide run on a coding agent's CLI, read-only, in the toured folder. Picking
   one is a background setting, not the point of the app: the start screen remembers the last choice.
@@ -44,8 +45,7 @@ in the background, plans the tour as a series of stops, and answers questions at
 - Simplicity first: no feature, crate or abstraction until it is needed. One crate for now.
 - Tour format: our own small JSON format (see `src/tour.rs`). CodeTour `.tour` export can be added later.
 - `engine.rs` owns planning and Q&A. A background daemon (`daemon.rs`) hosts one engine per folder,
-  so the TUI (`app.rs`, `ui.rs`) and MCP servers (`mcp.rs`) share tours and see each other's
-  questions live. The first front-end that needs the daemon starts it; it runs from a copy of the
+  so every open TUI (`app.rs`, `ui.rs`) shares the tours and sees the others' questions live. The first front-end that needs the daemon starts it; it runs from a copy of the
   exe (so rebuilds are not blocked), saves tours to `%LOCALAPPDATA%\tourer` (or
   `$XDG_STATE_HOME/tourer`), continues saved tours, and exits after 10 idle minutes. Front-ends
   talk to it over localhost TCP with a token, one JSON message per line. A front-end built
@@ -66,8 +66,6 @@ in the background, plans the tour as a series of stops, and answers questions at
 - Formatting: a small line-based markdown renderer of our own (`markdown.rs`), so we control wrapping
   and link order. Syntax highlighting uses syntect with bat's "ansi" theme (via two-face), so colors
   come from the terminal palette and work on light and dark themes.
-- Agents use MCP over stdio. We implement the few JSON-RPC methods we need by hand instead of
-  pulling in an async MCP SDK. Tools: `tour` (outline), `stop` (text plus code excerpts) and `ask`.
 
 ## Running
 - `cargo run -- <folder> [--agent claude|codex] [--model NAME] [--out tour.json] [--replan]` (needs
@@ -82,8 +80,6 @@ in the background, plans the tour as a series of stops, and answers questions at
   lines; hover a noted line for its note; drag the border to resize; the wheel scrolls.
 - Daemon log: `daemon.log` next to the saved tours.
 - Demo: `vhs demo/tourer.tape` records the README's `docs/demo.gif`; the tape says how to prepare it.
-- MCP: `tourer --mcp [--agent codex] [default-folder]` (default agent: the last one picked), e.g. `claude mcp add tourer -- /path/to/tourer --mcp`.
-  Tool calls take an optional `path`, and each folder's tour is planned once and shared.
 - `cargo test` covers markdown rendering (tables, link positions), line notes in the code pane,
   smooth scrolling, the order ↓ steps through, decoding codex events, unseen-update tracking, and parsing of planner
   lines, updates, answers and code references.

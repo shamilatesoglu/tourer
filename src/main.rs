@@ -4,7 +4,6 @@ mod daemon;
 mod engine;
 mod highlight;
 mod markdown;
-mod mcp;
 mod prefs;
 mod prompts;
 mod tour;
@@ -22,13 +21,12 @@ use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, E
 use ratatui::crossterm::execute;
 
 use crate::agent::Agent;
-use crate::prefs::Prefs;
 
 /// Guided, AI-planned tours of unfamiliar folders and codebases.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Folder to tour. With --mcp, the default folder for tool calls.
+    /// Folder to tour.
     #[arg(default_value = ".")]
     path: PathBuf,
     /// The agent that plans and guides the tour. Defaults to the one picked last time.
@@ -43,9 +41,6 @@ struct Args {
     /// Throw away the folder's saved tour and plan a new one.
     #[arg(long)]
     replan: bool,
-    /// Serve tours to other agents over MCP (stdio) instead of opening the TUI.
-    #[arg(long)]
-    mcp: bool,
     /// Run as the background daemon that owns all tours. Started automatically.
     #[arg(long, hide = true)]
     daemon: bool,
@@ -60,12 +55,6 @@ fn main() -> Result<()> {
         return daemon::run(args.build);
     }
     let root = args.path.canonicalize().with_context(|| format!("cannot open {}", args.path.display()))?;
-    if args.mcp {
-        let prefs = Prefs::load();
-        let agent = args.agent.unwrap_or(prefs.agent);
-        let model = args.model.or_else(|| prefs.model(agent).map(str::to_string));
-        return mcp::serve(root, agent, model);
-    }
 
     let (client, replies) = daemon::connect()?;
     let (tx, rx) = mpsc::channel();

@@ -2,7 +2,7 @@
 //! The daemon hosts one per folder and feeds it agent events; front-ends see its [`State`].
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use anyhow::Result;
@@ -129,10 +129,6 @@ impl Engine {
             None => engine.plan(String::new())?,
         }
         Ok(engine)
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Throws the tour away, questions included, and plans a new one, following `instructions`.

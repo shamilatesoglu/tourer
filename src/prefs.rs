@@ -1,4 +1,4 @@
-//! The agent and models picked last time, so the start screen and MCP servers default to them.
+//! The agent and models picked last time, so the start screen defaults to them.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

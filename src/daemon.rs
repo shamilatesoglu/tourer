@@ -1,4 +1,4 @@
-//! The background process that owns every tour, so the TUI and MCP servers share them.
+//! The background process that owns every tour, so every open TUI shares them.
 //! Front-ends connect over localhost TCP and exchange one JSON message per line. The first
 //! front-end to need it starts the daemon; it exits after a while without clients.
 //! Each folder has one tour per agent. Tours are saved to disk and continued when their
@@ -11,17 +11,15 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::agent::Agent;
 use crate::engine::{Engine, State};
-use crate::mcp;
 use crate::tour::{Anchor, Tour};
 
 /// How long the daemon stays up with no clients and no agent at work.
@@ -43,8 +41,6 @@ pub enum Request {
     Ask { root: PathBuf, agent: Agent, stop: usize, question: String, code: Option<Anchor> },
     /// The person saw a stop, or one of its answers, at this revision.
     Seen { root: PathBuf, agent: Agent, stop: usize, exchange: Option<usize>, revision: u32 },
-    /// An MCP tool call, answered with [`Reply::Tool`].
-    Tool { id: u64, root: PathBuf, agent: Agent, model: Option<String>, name: String, arguments: Value },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,7 +51,6 @@ pub enum Reply {
     WrongBuild,
     Tours { root: PathBuf, tours: Vec<TourSummary> },
     State { root: PathBuf, state: Box<State> },
-    Tool { id: u64, text: String, is_error: bool },
     Error { message: String },
 }
 
@@ -238,12 +233,6 @@ impl Shared {
         r
     }
 
-    /// Waits up to `timeout` while `busy` holds, then returns the engine, locked.
-    pub fn wait(&self, timeout: Duration, busy: impl Fn(&Engine) -> bool) -> EngineGuard<'_> {
-        let hosted = self.hosted.lock().unwrap();
-        EngineGuard(self.changed.wait_timeout_while(hosted, timeout, |h| busy(&h.engine)).unwrap().0)
-    }
-
     /// Saves the tour, once it has stops and planning is over.
     fn save(&self, tour: Option<Tour>) {
         let Some(tour) = tour else { return };
@@ -257,17 +246,6 @@ impl Shared {
     }
 }
 
-/// What one MCP client last read of each stop, by stop index, so outlines can point out updates.
-pub type Reads = Mutex<HashMap<usize, u32>>;
-
-pub struct EngineGuard<'a>(MutexGuard<'a, Hosted>);
-
-impl std::ops::Deref for EngineGuard<'_> {
-    type Target = Engine;
-    fn deref(&self) -> &Engine {
-        &self.0.engine
-    }
-}
 
 struct Daemon {
     dir: PathBuf,
@@ -342,11 +320,10 @@ impl Daemon {
 
         self.clients.fetch_add(1, Ordering::SeqCst);
         let connected = Arc::new(AtomicBool::new(true));
-        let mut reads = HashMap::new();
         let result = (|| -> Result<()> {
             for line in lines {
                 let request: Request = serde_json::from_str(&line?)?;
-                if let Err(err) = self.handle(request, &out, &connected, &mut reads) {
+                if let Err(err) = self.handle(request, &out, &connected) {
                     write_line(&mut *out.lock().unwrap(), &Reply::Error { message: format!("{err:#}") })?;
                 }
             }
@@ -363,7 +340,6 @@ impl Daemon {
         request: Request,
         out: &Arc<Mutex<TcpStream>>,
         connected: &Arc<AtomicBool>,
-        reads: &mut HashMap<(PathBuf, Agent), Arc<Reads>>,
     ) -> Result<()> {
         match request {
             Request::Hello { .. } => bail!("hello sent twice"),
@@ -390,18 +366,6 @@ impl Daemon {
                     Shared::tour_to_save(e)
                 });
                 shared.save(tour);
-            }
-            Request::Tool { id, root, agent, model, name, arguments } => {
-                let read = reads.entry((root.clone(), agent)).or_default().clone();
-                let shared = self.tour(&root, agent, model)?;
-                let out = out.clone();
-                thread::spawn(move || {
-                    let (text, is_error) = match mcp::call(&shared, &name, &arguments, &read) {
-                        Ok(text) => (text, false),
-                        Err(err) => (format!("{err:#}"), true),
-                    };
-                    let _ = write_line(&mut *out.lock().unwrap(), &Reply::Tool { id, text, is_error });
-                });
             }
         }
         Ok(())

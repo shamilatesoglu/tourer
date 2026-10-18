@@ -22,8 +22,6 @@ Asking a coding agent to "explain this repo" gives you one long answer. A tour i
   answer, it updates it, and marks the parts you have not seen yet with ✦.
 - **It is saved.** Tours and the guide's conversation survive restarts, so you can come back
   tomorrow and keep asking.
-- **Agents can take the tour too.** `tourer --mcp` serves the same tours to other coding
-  agents, and they share them with the TUI.
 
 ## Install
 
@@ -73,18 +71,6 @@ tourer [FOLDER] [--agent claude|codex] [--model NAME] [--replan] [--out tour.jso
 ```
 
 `--out` writes the whole tour, with questions and answers, as JSON when you quit.
-
-## For agents (MCP)
-
-```sh
-claude mcp add tourer -- tourer --mcp
-codex mcp add tourer -- tourer --mcp
-```
-
-This gives the agent three tools: `tour` (the outline), `stop` (a stop's text with the code
-it cites) and `ask`. Each takes an optional `path`, and each folder's tour is planned once
-and shared with the TUI and with other agents. Outlines say which stops changed since that
-agent last read them.
 
 ## How it works
 

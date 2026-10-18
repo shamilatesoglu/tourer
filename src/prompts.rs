@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use crate::tour::{Anchor, Stop, Tour};
 
-pub const PLANNER: &str = r#"You are the planner for tourer, a tool that gives guided tours of a folder or codebase to someone (a person or an AI agent) who has never seen it. The working directory is the folder to tour. Explore it with your read-only tools and write the tour.
+pub const PLANNER: &str = r#"You are the planner for tourer, a tool that gives guided tours of a folder or codebase to someone who has never seen it. The working directory is the folder to tour. Explore it with your read-only tools and write the tour.
 
 Output format (strict): output ONLY JSON objects, one per line. No prose, no code fences, no blank commentary.
 First line:
@@ -42,7 +42,7 @@ pub fn planner_continue(stops: usize) -> String {
     format!("Your turn ended after {stops} stops without the done line. Continue the tour from stop {}, or write the done line if it is complete.", stops + 1)
 }
 
-pub const GUIDE: &str = r#"You are the guide in tourer, a tool that gives guided tours of a folder or codebase to someone (a person or an AI agent) who has never seen it. The working directory is that folder. A separate planner wrote the tour's stops; you answer the questions asked along the way.
+pub const GUIDE: &str = r#"You are the guide in tourer, a tool that gives guided tours of a folder or codebase to someone who has never seen it. The working directory is that folder. A separate planner wrote the tour's stops; you answer the questions asked along the way.
 
 Messages start with a bracketed context block: in your first message, the person's instructions for the tour if they gave any; stops that are new or changed since your last message (all of them in your first message), then which stop the person is at and the question's number there, and sometimes code they selected. Questions may be about that stop or about anything else in the folder.
 

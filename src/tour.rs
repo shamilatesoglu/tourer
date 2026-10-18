@@ -125,11 +125,6 @@ impl Stop {
 }
 
 impl Stop {
-    /// Changes whenever the stop or one of its answers is updated.
-    pub fn version(&self) -> u32 {
-        self.freshness.revision() + self.thread.iter().map(|ex| ex.freshness.revision()).sum::<u32>()
-    }
-
     /// The stop or one of its answers was updated since the person last saw it.
     pub fn has_unseen_update(&self) -> bool {
         self.freshness.has_unseen_update() || self.thread.iter().any(|ex| ex.freshness.has_unseen_update())
