@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod daemon;
+mod diff;
 mod engine;
 mod highlight;
 mod markdown;
@@ -38,6 +39,10 @@ struct Args {
     /// Write the tour, including questions and answers, as JSON when quitting.
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Tour the changes since this git revision instead of the whole folder: the changes from
+    /// where it meets HEAD to the files on disk. Without a revision, the uncommitted changes.
+    #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "HEAD")]
+    diff: Option<String>,
     /// Throw away the folder's saved tour and plan a new one.
     #[arg(long)]
     replan: bool,
@@ -55,6 +60,9 @@ fn main() -> Result<()> {
         return daemon::run(args.build);
     }
     let root = args.path.canonicalize().with_context(|| format!("cannot open {}", args.path.display()))?;
+    if let Some(rev) = &args.diff {
+        diff::base(&root, rev)?;
+    }
 
     let (client, replies) = daemon::connect()?;
     let (tx, rx) = mpsc::channel();
@@ -65,7 +73,7 @@ fn main() -> Result<()> {
             }
         }
     });
-    let mut app = app::App::new(client, root, args.agent, args.model, args.replan);
+    let mut app = app::App::new(client, root, args.diff, args.agent, args.model, args.replan);
 
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
@@ -73,6 +81,7 @@ fn main() -> Result<()> {
         while !app.quit {
             terminal.draw(|f| ui::draw(f, &mut app))?;
             app.report_seen();
+            app.check_files();
             let wait = if app.is_animating() { 16 } else { 50 };
             if event::poll(Duration::from_millis(wait))? {
                 match event::read()? {

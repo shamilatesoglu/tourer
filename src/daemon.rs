@@ -1,7 +1,8 @@
 //! The background process that owns every tour, so every open TUI shares them.
 //! Front-ends connect over localhost TCP and exchange one JSON message per line. The first
 //! front-end to need it starts the daemon; it exits after a while without clients.
-//! Each folder has one tour per agent. Tours are saved to disk and continued when their
+//! Each folder has one tour per agent, and one per agent for each git revision whose changes
+//! are toured. Tours are saved to disk and continued when their
 //! folder is opened again.
 
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::Agent;
+use crate::diff::{self, BaseState};
 use crate::engine::{Engine, State};
 use crate::tour::{Anchor, Tour};
 
@@ -32,15 +34,16 @@ const UPDATE_GAP: Duration = Duration::from_millis(30);
 pub enum Request {
     /// Must come first on every connection.
     Hello { token: String, build: String },
-    /// Lists a folder's tours, answered with [`Reply::Tours`].
-    List { root: PathBuf },
+    /// Lists a folder's tours, answered with [`Reply::Tours`]. Requests that take `diff` are
+    /// about the tour of the changes since that git revision, if given.
+    List { root: PathBuf, diff: Option<String> },
     /// Opens a folder's tour and sends its state now and whenever it changes. A replan follows
     /// `instructions`.
-    Open { root: PathBuf, agent: Agent, model: Option<String>, replan: bool, instructions: String },
+    Open { root: PathBuf, diff: Option<String>, agent: Agent, model: Option<String>, replan: bool, instructions: String },
     /// Asks a question at a stop, optionally about some lines of code.
-    Ask { root: PathBuf, agent: Agent, stop: usize, question: String, code: Option<Anchor> },
+    Ask { root: PathBuf, diff: Option<String>, agent: Agent, stop: usize, question: String, code: Option<Anchor> },
     /// The person saw a stop, or one of its answers, at this revision.
-    Seen { root: PathBuf, agent: Agent, stop: usize, exchange: Option<usize>, revision: u32 },
+    Seen { root: PathBuf, diff: Option<String>, agent: Agent, stop: usize, exchange: Option<usize>, revision: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,7 +52,8 @@ pub enum Reply {
     Welcome,
     /// The daemon is from another build of tourer.
     WrongBuild,
-    Tours { root: PathBuf, tours: Vec<TourSummary> },
+    /// A folder's tours, or tours of its changes since `diff`.
+    Tours { root: PathBuf, diff: Option<String>, tours: Vec<TourSummary> },
     State { root: PathBuf, state: Box<State> },
     Error { message: String },
 }
@@ -63,10 +67,12 @@ pub struct TourSummary {
     pub stops: usize,
     pub questions: usize,
     pub planning: bool,
+    /// For a diff tour, whether it still starts where its revision meets HEAD.
+    pub base: Option<BaseState>,
 }
 
 impl TourSummary {
-    fn new(agent: Agent, tour: &Tour, planning: bool) -> Self {
+    fn new(agent: Agent, tour: &Tour, planning: bool, root: &Path) -> Self {
         TourSummary {
             agent,
             title: tour.title.clone(),
@@ -74,6 +80,7 @@ impl TourSummary {
             stops: tour.stops.len(),
             questions: tour.stops.iter().map(|s| s.thread.len()).sum(),
             planning,
+            base: tour.diff.as_ref().map(|base| diff::base_state(root, base)),
         }
     }
 }
@@ -108,6 +115,20 @@ fn build_id() -> String {
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
     format!("{}-{modified}", env!("CARGO_PKG_VERSION"))
+}
+
+/// `text` as part of a file name, different for different texts: letters, digits, `-` and `.`
+/// stay, any other character becomes its code in hex between two `_`.
+fn file_name_part(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+            out.push(c);
+        } else {
+            out.push_str(&format!("_{:x}_", c as u32));
+        }
+    }
+    out
 }
 
 fn write_line(out: &mut impl Write, msg: &impl Serialize) -> Result<()> {
@@ -246,13 +267,15 @@ impl Shared {
     }
 }
 
+/// Which tour: a folder's, or of its changes since a git revision, by an agent.
+type Key = (PathBuf, Option<String>, Agent);
 
 struct Daemon {
     dir: PathBuf,
     token: String,
     build: String,
     port: u16,
-    tours: Mutex<HashMap<(PathBuf, Agent), Arc<Shared>>>,
+    tours: Mutex<HashMap<Key, Arc<Shared>>>,
     clients: AtomicUsize,
     last_client: Mutex<Instant>,
 }
@@ -343,24 +366,24 @@ impl Daemon {
     ) -> Result<()> {
         match request {
             Request::Hello { .. } => bail!("hello sent twice"),
-            Request::List { root } => {
-                let tours = self.list(&root);
-                write_line(&mut *out.lock().unwrap(), &Reply::Tours { root, tours })?;
+            Request::List { root, diff } => {
+                let tours = self.list(&root, diff.as_deref());
+                write_line(&mut *out.lock().unwrap(), &Reply::Tours { root, diff, tours })?;
             }
-            Request::Open { root, agent, model, replan, instructions } => {
-                let shared = self.tour(&root, agent, model)?;
+            Request::Open { root, diff, agent, model, replan, instructions } => {
+                let shared = self.tour((root.clone(), diff, agent), model)?;
                 if replan {
                     shared.update(|e| e.replan(instructions))?;
                 }
                 let (out, connected) = (out.clone(), connected.clone());
                 thread::spawn(move || watch(&shared, &root, &out, &connected));
             }
-            Request::Ask { root, agent, stop, question, code } => {
-                let shared = self.hosted(root, agent)?;
+            Request::Ask { root, diff, agent, stop, question, code } => {
+                let shared = self.hosted((root, diff, agent))?;
                 shared.update(|e| e.ask(stop, &question, code)).context("no such stop")?;
             }
-            Request::Seen { root, agent, stop, exchange, revision } => {
-                let shared = self.hosted(root, agent)?;
+            Request::Seen { root, diff, agent, stop, exchange, revision } => {
+                let shared = self.hosted((root, diff, agent))?;
                 let tour = shared.update(|e| {
                     e.mark_seen(stop, exchange, revision);
                     Shared::tour_to_save(e)
@@ -372,36 +395,41 @@ impl Daemon {
     }
 
     /// A tour that a front-end has opened.
-    fn hosted(&self, root: PathBuf, agent: Agent) -> Result<Arc<Shared>> {
-        self.tours.lock().unwrap().get(&(root, agent)).cloned().context("open the tour first")
+    fn hosted(&self, key: Key) -> Result<Arc<Shared>> {
+        self.tours.lock().unwrap().get(&key).cloned().context("open the tour first")
     }
 
-    /// A folder's tours, one per agent at most: hosted ones, else saved ones.
-    fn list(&self, root: &Path) -> Vec<TourSummary> {
+    /// A folder's tours, or tours of its changes since `diff`, one per agent at most: hosted
+    /// ones, else saved ones.
+    fn list(&self, root: &Path, diff: Option<&str>) -> Vec<TourSummary> {
         let tours = self.tours.lock().unwrap();
         Agent::ALL
             .into_iter()
-            .filter_map(|agent| match tours.get(&(root.to_path_buf(), agent)) {
-                Some(shared) => {
-                    let state = &shared.hosted.lock().unwrap().engine.state;
-                    Some(TourSummary::new(agent, &state.tour, state.planning))
+            .filter_map(|agent| {
+                let key = (root.to_path_buf(), diff.map(str::to_string), agent);
+                match tours.get(&key) {
+                    Some(shared) => {
+                        let state = &shared.hosted.lock().unwrap().engine.state;
+                        Some(TourSummary::new(agent, &state.tour, state.planning, root))
+                    }
+                    None => self.saved(&key).map(|tour| TourSummary::new(agent, &tour, false, root)),
                 }
-                None => self.saved(root, agent).map(|tour| TourSummary::new(agent, &tour, false)),
             })
             .collect()
     }
 
-    fn saved(&self, root: &Path, agent: Agent) -> Option<Tour> {
-        std::fs::read(self.tour_file(root, agent))
+    fn saved(&self, key: &Key) -> Option<Tour> {
+        let (root, diff, _) = key;
+        std::fs::read(self.tour_file(key))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Tour>(&bytes).ok())
             .filter(|t| Path::new(&t.root) == root && !t.stops.is_empty())
+            .filter(|t| t.diff.as_ref().map(|d| &d.rev) == diff.as_ref())
     }
 
-    /// A folder's tour by an agent: hosted already, saved earlier, or newly planned.
-    fn tour(&self, root: &Path, agent: Agent, model: Option<String>) -> Result<Arc<Shared>> {
+    /// A tour: hosted already, saved earlier, or newly planned.
+    fn tour(&self, key: Key, model: Option<String>) -> Result<Arc<Shared>> {
         let mut tours = self.tours.lock().unwrap();
-        let key = (root.to_path_buf(), agent);
         if let Some(shared) = tours.get(&key) {
             // A tour that failed before it had any stops is planned again.
             let state = &shared.hosted.lock().unwrap().engine.state;
@@ -409,9 +437,10 @@ impl Daemon {
                 return Ok(shared.clone());
             }
         }
-        let file = self.tour_file(root, agent);
+        let file = self.tour_file(&key);
         let (tx, rx) = mpsc::channel();
-        let engine = Engine::new(root.to_path_buf(), agent, model, tx, self.saved(root, agent))?;
+        let (root, diff, agent) = key.clone();
+        let engine = Engine::new(root, diff, agent, model, tx, self.saved(&key))?;
         let hosted = Mutex::new(Hosted { engine, version: 0 });
         let shared = Arc::new(Shared { hosted, changed: Condvar::new(), file });
         let pump = shared.clone();
@@ -429,14 +458,16 @@ impl Daemon {
         Ok(shared)
     }
 
-    /// The file a folder's tour is saved in, named after the folder's path and the agent.
-    fn tour_file(&self, root: &Path, agent: Agent) -> PathBuf {
-        let name: String = root
+    /// The file a tour is saved in, named after the folder's path, the revision of a diff
+    /// tour and the agent.
+    fn tour_file(&self, (root, diff, agent): &Key) -> PathBuf {
+        let root: String = root
             .to_string_lossy()
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
             .collect();
-        self.dir.join("tours").join(format!("{}.{agent}.json", name.trim_matches('_')))
+        let diff = diff.as_deref().map(|rev| format!(".diff-{}", file_name_part(rev))).unwrap_or_default();
+        self.dir.join("tours").join(format!("{}{diff}.{agent}.json", root.trim_matches('_')))
     }
 
     fn exit_when_idle(&self) {
@@ -493,5 +524,18 @@ fn watch(shared: &Shared, root: &Path, out: &Mutex<TcpStream>, connected: &Atomi
             return;
         }
         thread::sleep(UPDATE_GAP);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_files_apart_for_different_revisions() {
+        let names = ["feature/x", "feature_x", "feature-x", "_2f_", "/a", "\u{2fa}"].map(file_name_part);
+        assert_eq!(names[0], "feature_2f_x");
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
     }
 }

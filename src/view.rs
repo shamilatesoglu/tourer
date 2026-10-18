@@ -4,17 +4,21 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use crate::agent::Agent;
 use crate::app::Action;
+use crate::diff::{self, Changes};
 use crate::engine::State;
 use crate::highlight::{Highlighter, StyledLine};
 use crate::tour::Anchor;
 
+/// How often the files shown are checked for changes on disk.
+const CHECK_FILES_EVERY: Duration = Duration::from_secs(2);
 /// How long an item must be on screen before it counts as seen.
 const SEEN_AFTER: Duration = Duration::from_millis(1500);
 /// Folders the file picker leaves out, besides hidden ones.
@@ -240,12 +244,31 @@ enum Drag {
     Select,
 }
 
+/// A file's highlighted lines, and when the file was changed when they were read. A file that
+/// could not be read has no lines.
+struct CachedFile {
+    modified: Option<SystemTime>,
+    lines: Option<Vec<StyledLine>>,
+}
+
+/// When a file was last changed; `None` if it cannot be read.
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 pub struct TourView {
     pub agent: Agent,
     pub state: State,
     root: PathBuf,
     pub hl: Highlighter,
-    files: HashMap<String, Option<Vec<StyledLine>>>,
+    files: HashMap<String, CachedFile>,
+    /// A diff tour's changes, read from git when its base commit is known and again when a
+    /// file shown changes.
+    pub changes: Option<Rc<Changes>>,
+    /// The commit `changes` start from.
+    changes_from: Option<String>,
+    /// When the files shown were last checked for changes on disk.
+    checked: Instant,
     /// Every file in the folder, listed when the file picker first opens.
     all_files: Option<Vec<String>>,
     pub text: Scroll,
@@ -285,6 +308,9 @@ impl TourView {
             root,
             hl: Highlighter::new(),
             files: HashMap::new(),
+            changes: None,
+            changes_from: None,
+            checked: Instant::now(),
             all_files: None,
             text: Scroll::default(),
             code: CodeView {
@@ -319,18 +345,46 @@ impl TourView {
     }
 
     pub fn set_state(&mut self, state: State) {
+        let commit = state.tour.diff.as_ref().map(|d| d.commit.clone());
+        if commit != self.changes_from {
+            self.changes_from = commit;
+            self.read_changes();
+        }
         self.state = state;
     }
 
-    /// A file's highlighted lines, read once and cached.
+    fn read_changes(&mut self) {
+        let commit = self.changes_from.as_deref();
+        self.changes = commit.and_then(|c| diff::changes(&self.root, c).ok()).map(Rc::new);
+    }
+
+    /// Forgets the files shown that changed on disk, so they are read again, and then reads a
+    /// diff tour's changes again. Checks at most every [`CHECK_FILES_EVERY`].
+    pub fn check_files(&mut self) {
+        if self.checked.elapsed() < CHECK_FILES_EVERY {
+            return;
+        }
+        self.checked = Instant::now();
+        let before = self.files.len();
+        let root = &self.root;
+        self.files.retain(|path, file| modified(&root.join(path)) == file.modified);
+        if self.files.len() < before && self.changes_from.is_some() {
+            self.read_changes();
+        }
+    }
+
+    /// A file's highlighted lines, cached until the file changes.
     pub fn file(&mut self, path: &str) -> Option<&Vec<StyledLine>> {
         let (root, hl) = (&self.root, &self.hl);
         self.files
             .entry(path.to_string())
             .or_insert_with(|| {
-                let bytes = std::fs::read(root.join(path)).ok()?;
-                Some(hl.file(path, &String::from_utf8_lossy(&bytes)))
+                let file = root.join(path);
+                let modified = modified(&file);
+                let lines = std::fs::read(&file).ok().map(|bytes| hl.file(path, &String::from_utf8_lossy(&bytes)));
+                CachedFile { modified, lines }
             })
+            .lines
             .as_ref()
     }
 
@@ -483,14 +537,16 @@ impl TourView {
         self.popup = if self.wide { None } else { Some(Popup::Code) };
     }
 
-    /// The folder's files whose paths contain every word of `query`, shortest first.
+    /// The folder's files whose paths contain every word of `query`: in a diff tour the changed
+    /// ones first, then shortest first.
     pub fn matching_files(&mut self, query: &str) -> Vec<String> {
         let root = self.root.clone();
         let all = self.all_files.get_or_insert_with(|| list_files(&root));
         let words: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
         let mut found: Vec<String> =
             all.iter().filter(|p| words.iter().all(|w| p.to_lowercase().contains(w))).cloned().collect();
-        found.sort_by_key(|p| (p.len(), p.clone()));
+        let changed = |p: &String| self.changes.as_ref().is_some_and(|c| c.files.iter().any(|(f, _)| f == p));
+        found.sort_by_cached_key(|p| (!changed(p), p.len(), p.clone()));
         found
     }
 

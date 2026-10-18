@@ -44,6 +44,21 @@ in the background, plans the tour as a series of stops, and answers questions at
   continue, up to 3 times. The daemon log says why each turn ended and shows any planner line
   that could not be read. Several JSON objects on one line are all read.
 - Simplicity first: no feature, crate or abstraction until it is needed. One crate for now.
+- Diff tours: `--diff [REV]` tours the changes since a git revision instead of the whole folder:
+  from where REV meets HEAD (so `main` means a branch's own changes) to the files on disk, so
+  uncommitted and untracked files count and `--diff` alone means the uncommitted changes. The new
+  side is always the folder as it is, so anchors, the code pane and the agents' reads work as in
+  any tour. The agents cannot run git, so `diff.rs` runs it and the diff goes in the planner's
+  first message and in the guide's first message (not the system prompt, which is a command-line
+  argument for claude). The prompts swap the newcomer's order for a reviewer's. A tour saves the
+  base commit it was planned from, and each revision has its own tour per agent; the start screen
+  says when the revision no longer meets HEAD there. The code pane marks added
+  lines `+`, lines with removed ones just above `-`, and both `±`; the removed lines show in the
+  note popup, so every screen row stays one line of the file. Changes are read from git again
+  whenever they are used, and by the TUI when a file it shows changes on disk.
+  - In a git repository the start screen's Tour row picks the folder, the uncommitted changes,
+    the branch's own changes since the main branch (`origin/HEAD`, else `main` or `master`), or
+    the changes since a revision typed in. `--diff` preselects it; it is not saved in prefs.
 - Tour format: our own small JSON format (see `src/tour.rs`). CodeTour `.tour` export can be added later.
 - `engine.rs` owns planning and Q&A. A background daemon (`daemon.rs`) hosts one engine per folder,
   so every open TUI (`app.rs`, `ui.rs`) shares the tours and sees the others' questions live. The first front-end that needs the daemon starts it; it runs from a copy of the
@@ -51,7 +66,7 @@ in the background, plans the tour as a series of stops, and answers questions at
   `$XDG_STATE_HOME/tourer`), continues saved tours, and exits after 10 idle minutes. Front-ends
   talk to it over localhost TCP with a token, one JSON message per line. A front-end built
   differently from the running daemon starts a new one.
-- TUI: a start screen (continue the tour, plan a new one, instructions for it, guide, model), then the tour: one
+- TUI: a start screen (what to tour, continue the tour, plan a new one, instructions for it, guide, model), then the tour: one
   scrolling document of all stops beside the code pane, which follows the first code reference
   on screen. Scrolling glides, stops have a progress line on top, questions are typed inline,
   and popups show notes, the list of stops and a file picker. Under 100 columns the code goes
@@ -74,12 +89,12 @@ in the background, plans the tour as a series of stops, and answers questions at
 - History tours: besides a tour of the folder as it is, a tour of how it got there. Git commits
   are only part of it; much of a project's reasoning now lives in agent conversations (Claude
   Code and Codex sessions: the prompts, the options weighed, the decisions made). Show that
-  development and its decisions in a way that is good to look at, not as a log. The unmerged
-  `diff-tours` branch (tour the changes since a git revision) covers the git side.
+  development and its decisions in a way that is good to look at, not as a log. Diff tours
+  (`--diff`) cover touring a change, but not its history.
 
 ## Running
-- `cargo run -- <folder> [--agent claude|codex] [--model NAME] [--out tour.json] [--replan]` (needs
-  the agent's CLI on PATH and logged in). `--agent`, `--model` and `--replan` preselect the start
+- `cargo run -- <folder> [--diff [REV]] [--agent claude|codex] [--model NAME] [--out tour.json] [--replan]` (needs
+  the agent's CLI on PATH and logged in). `--diff`, `--agent`, `--model` and `--replan` preselect the start
   screen; the agent and model picked there are saved in `prefs.json` next to the tours.
 - Keys: `↑`/`↓` (or `Space`) step through the text, or move the code cursor; `←`/`→` change
   stop; `PgUp`/`PgDn`/`Home`/`End` scroll; `Shift`+`↑`/`↓` select code lines; `Tab` switch pane;
@@ -91,5 +106,7 @@ in the background, plans the tour as a series of stops, and answers questions at
 - Daemon log: `daemon.log` next to the saved tours.
 - Demo: `vhs demo/tourer.tape` records the README's `docs/demo.gif`; the tape says how to prepare it.
 - `cargo test` covers markdown rendering (tables, link positions), line notes in the code pane,
-  smooth scrolling, the order ↓ steps through, decoding codex events, unseen-update tracking, and parsing of planner
+  smooth scrolling, the order ↓ steps through, reading git diffs and marking changed lines, what
+  the start screen offers to tour and whether a diff tour's base moved (against a throwaway git
+  repository), tour file names, decoding codex events, unseen-update tracking, and parsing of planner
   lines, updates, answers and code references.

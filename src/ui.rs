@@ -12,7 +12,8 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use textwrap::core::display_width;
 
 use crate::agent::Agent;
-use crate::app::{App, Row, Screen, Start};
+use crate::app::{App, Row, Screen, Start, Subject};
+use crate::diff::{self, BaseState, FileChanges, Status};
 use crate::engine::AnswerState;
 use crate::highlight::StyledLine;
 use crate::markdown::Renderer;
@@ -49,7 +50,7 @@ fn left_cut(s: &str, width: usize) -> String {
     format!("…{}", tail.into_iter().rev().collect::<String>())
 }
 
-/// The tour to continue or start, and the agent that guides it.
+/// What to tour, the tour to continue or start, and the agent that guides it.
 fn draw_start(f: &mut Frame, start: &mut Start, root: &str, area: Rect) {
     let width = area.width.min(76);
     let x = area.x + (area.width - width) / 2;
@@ -66,6 +67,34 @@ fn draw_start(f: &mut Frame, start: &mut Start, root: &str, area: Rect) {
         (None, Line::from(left_cut(root, width as usize)).dim()),
         (None, Line::from("")),
     ];
+    if start.subjects.len() > 1 {
+        let mut subjects = vec![label(Row::Subject, "Tour")];
+        for (i, subject) in start.subjects.iter().enumerate() {
+            let name = match subject {
+                Subject::Folder => "folder".to_string(),
+                Subject::Uncommitted { .. } => "uncommitted".to_string(),
+                Subject::Branch { .. } => "this branch".to_string(),
+                Subject::Since(rev) if i == start.subject && row == Row::Subject => format!("since {rev}▏"),
+                Subject::Since(rev) if i == start.subject && !rev.is_empty() => format!("since {rev}"),
+                Subject::Since(_) => "since…".to_string(),
+            };
+            subjects.push(if i == start.subject { Span::from(name).reversed() } else { Span::from(name).dim() });
+            subjects.push(Span::from("   "));
+        }
+        lines.push((Some(Row::Subject), Line::from(subjects)));
+        let about = match &start.subjects[start.subject] {
+            Subject::Folder => "the whole folder".to_string(),
+            Subject::Uncommitted { files } => format!("{} changed since the last commit", count(*files, "file")),
+            Subject::Branch { main, commits } => {
+                format!("{} since {main}, and uncommitted changes", count(*commits, "commit"))
+            }
+            Subject::Since(rev) if rev.trim().is_empty() => "type a branch, tag or commit".to_string(),
+            Subject::Since(rev) => format!("the changes since {}, and uncommitted ones", rev.trim()),
+        };
+        lines.push((None, Line::from(format!("{:17}{about}", "")).dim()));
+        lines.push((None, Line::from("")));
+    }
+    let base = start.existing().and_then(|t| t.base.as_ref());
     match (&start.tours, start.existing()) {
         (None, _) => lines.push((None, Line::from("  Looking for saved tours…").dim())),
         (Some(_), Some(tour)) => {
@@ -78,11 +107,19 @@ fn draw_start(f: &mut Frame, start: &mut Start, root: &str, area: Rect) {
             let about = vec![label(Row::Continue, "Continue tour"), Span::from(title.to_string()).bold()];
             lines.push((Some(Row::Continue), Line::from(about)));
             lines.push((None, Line::from(format!("{:17}{progress}", "")).dim()));
-            let new = vec![label(Row::New, "New tour"), Span::from("plan it again, replacing this one").dim()];
+            if let Some(warning) = base.and_then(BaseState::warning) {
+                lines.push((None, Line::from(format!("{:17}{warning}", "")).yellow()));
+            }
+            let again = match base {
+                Some(BaseState::Moved { now, .. }) => format!("plan it again from {}", diff::short(now)),
+                _ => "plan it again, replacing this one".to_string(),
+            };
+            let new = vec![label(Row::New, "New tour"), Span::from(again).dim()];
             lines.push((Some(Row::New), Line::from(new)));
         }
         (Some(_), None) => {
-            let new = vec![label(Row::New, "Start tour"), Span::from("plan a tour of this folder").dim()];
+            let what = if start.diff().is_some() { "plan a tour of these changes" } else { "plan a tour of this folder" };
+            let new = vec![label(Row::New, "Start tour"), Span::from(what).dim()];
             lines.push((Some(Row::New), Line::from(new)));
         }
     }
@@ -398,6 +435,7 @@ fn document(view: &mut TourView, width: usize, height: usize) -> (Vec<Line<'stat
 fn excerpt_lines(view: &mut TourView, stop: &Stop, width: usize) -> Vec<Line<'static>> {
     const MAX_LINES: usize = 15;
     let mut out = vec![];
+    let changes = view.changes.clone();
     for a in &stop.anchors {
         let notes: Vec<Note> = stop.notes_in(&a.path).into_iter().cloned().collect();
         let Some(file) = view.file(&a.path) else { continue };
@@ -405,7 +443,9 @@ fn excerpt_lines(view: &mut TourView, stop: &Stop, width: usize) -> Vec<Line<'st
         out.push(Line::from(a.to_string()).dim());
         let lines = (a.end + 1).saturating_sub(a.start);
         let marks = Marks { range: Some((a.start, a.end)), ..Default::default() };
-        out.extend(code_lines(file, &notes, a.start.saturating_sub(1), lines.min(MAX_LINES), width, marks).0);
+        let changes = changes.as_deref().map(|c| c.file(&a.path));
+        let lines = lines.min(MAX_LINES);
+        out.extend(code_lines(file, &notes, changes, a.start.saturating_sub(1), lines, width, marks).0);
         if lines > MAX_LINES {
             let more = format!("  … {} more; click the reference to open it", count(lines - MAX_LINES, "line"));
             out.push(Line::from(more).dim());
@@ -510,9 +550,17 @@ fn draw_code(f: &mut Frame, view: &mut TourView, area: Rect) {
     };
     let top = view.code.scroll.top();
     let block = pane_block(view, Pane::Code).title(title);
-    let (lines, more) = match view.file(&target.path) {
-        None => (vec![Line::from("(file not found)").dim()], vec![]),
-        Some(file) => code_lines(file, &notes, top, height, width, marks),
+    let changes = view.changes.clone();
+    let changes = changes.as_deref().map(|c| c.file(&target.path));
+    let (lines, more) = match (view.file(&target.path), changes) {
+        (Some(file), _) => code_lines(file, &notes, changes, top, height, width, marks),
+        (None, Some(c)) if c.status == Status::Deleted => {
+            let mut lines = vec![Line::from("(deleted in this change)").dim()];
+            let old = c.removed.values().flatten().take(height.saturating_sub(1));
+            lines.extend(old.map(|l| Line::from(format!("- {}", l.replace('\t', "    "))).red()));
+            (lines, vec![])
+        }
+        (None, _) => (vec![Line::from("(file not found)").dim()], vec![]),
     };
     view.code.more_notes = more;
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -529,10 +577,13 @@ struct Marks {
 }
 
 /// Numbered code lines from `scroll` on. Notes go after their line, cut to fit; also returns
-/// the lines whose notes say more than that, and whether their text was cut.
+/// the lines whose notes say more than that, and whether their text was cut. In a diff tour, a
+/// column after the number marks added lines `+`, lines with old ones removed just above them
+/// `-`, and both `±`; the removed lines show in a popup.
 fn code_lines(
     file: &[StyledLine],
     notes: &[Note],
+    changes: Option<&FileChanges>,
     scroll: usize,
     height: usize,
     width: usize,
@@ -560,8 +611,20 @@ fn code_lines(
             Span::from(" ")
         };
         let code: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        let used = digits + 1 + display_width(&code);
-        let mut line = vec![number, gutter];
+        let mut used = digits + 1 + display_width(&code);
+        let mut line = vec![number];
+        if let Some(c) = changes {
+            let added = c.added.contains(&n);
+            let removed = !c.removed_above(n, file.len()).is_empty();
+            line.push(match (added, removed) {
+                (true, true) => Span::from("±").yellow(),
+                (true, false) => Span::from("+").green(),
+                (false, true) => Span::from("-").red(),
+                (false, false) => Span::from(" "),
+            });
+            used += 1;
+        }
+        line.push(gutter);
         line.extend(spans.iter().cloned());
         let said: Vec<&Note> = notes.iter().filter(|note| note.line == n).collect();
         if !said.is_empty() {
@@ -595,16 +658,25 @@ fn draw_note_popup(f: &mut Frame, view: &mut TourView) {
     let hovered = view.hover.filter(|p| area.contains(*p)).and_then(|p| view.code_line_at(p.y));
     let line = hovered.or((view.focus == Pane::Code).then_some(view.code.cursor));
     let (Some(line), Some(target)) = (line, view.code.last.as_ref()) else { return };
-    let Some(&(_, cut)) = view.code.more_notes.iter().find(|(n, _)| *n == line) else { return };
     let Some(stop) = view.state.tour.stops.get(view.current) else { return };
-    let notes: Vec<&Note> = stop.notes_in(&target.path).into_iter().filter(|n| n.line == line).collect();
+    let changes = view.changes.as_deref().map(|c| c.file(&target.path));
+    let removed = changes.map(|c| c.removed_above(line, view.code.lines)).unwrap_or_default();
+    // Notes show only if they say more than the line does.
+    let more = view.code.more_notes.iter().find(|(n, _)| *n == line);
+    let notes: Vec<&Note> = match more {
+        Some(_) => stop.notes_in(&target.path).into_iter().filter(|n| n.line == line).collect(),
+        None => vec![],
+    };
+    let cut = more.is_some_and(|&(_, cut)| cut);
     let top = view.code.scroll.top();
-    if notes.is_empty() || line <= top || line > top + view.code.height {
+    if (notes.is_empty() && removed.is_empty()) || line <= top || line > top + view.code.height {
         return;
     }
-    let width = area.width.saturating_sub(8).min(64);
+    const MAX_REMOVED: usize = 12;
+    let width = area.width.saturating_sub(8).min(if removed.is_empty() { 64 } else { 96 });
+    let inner = width.saturating_sub(4) as usize;
     let wrap = |s: &str| -> Vec<Line<'static>> {
-        let lines = textwrap::wrap(s, width.saturating_sub(4) as usize);
+        let lines = textwrap::wrap(s, inner);
         lines.into_iter().map(|l| Line::from(l.into_owned())).collect()
     };
     let mut text: Vec<Line> = vec![];
@@ -617,12 +689,27 @@ fn draw_note_popup(f: &mut Frame, view: &mut TourView) {
         }
         text.extend(wrap(&n.detail));
     }
+    if !notes.is_empty() && !removed.is_empty() {
+        text.push(Line::default());
+    }
+    for old in removed.iter().take(MAX_REMOVED) {
+        let old: String = format!("- {}", old.replace('\t', "    ")).chars().take(inner).collect();
+        text.push(Line::from(old).red());
+    }
+    if removed.len() > MAX_REMOVED {
+        text.push(Line::from(format!("  … {} more", count(removed.len() - MAX_REMOVED, "removed line"))).dim());
+    }
     let height = text.len() as u16 + 2;
     let row = area.y + 1 + (line - 1 - top) as u16;
     let y = if row + 1 + height <= area.bottom() { row + 1 } else { row.saturating_sub(height) };
     let popup = Rect::new(area.x + 6, y, width, height).intersection(f.area());
     f.render_widget(Clear, popup);
-    let block = Block::bordered().border_style(Style::new().fg(Color::Green)).title(format!(" note · line {line} "));
+    let (color, title) = match (notes.is_empty(), removed.is_empty()) {
+        (false, true) => (Color::Green, format!(" note · line {line} ")),
+        (true, _) => (Color::Red, format!(" removed above line {line} ")),
+        (false, false) => (Color::Green, format!(" note · line {line} · removed above it ")),
+    };
+    let block = Block::bordered().border_style(Style::new().fg(color)).title(title);
     f.render_widget(Paragraph::new(text).block(block), popup);
 }
 
@@ -774,14 +861,17 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 
 fn start_keys(start: &Start) -> Vec<(&'static str, &'static str)> {
     let mut keys = vec![("↑↓", "choose")];
+    let typing = matches!(start.row(), Row::Model | Row::Instructions) || (start.row() == Row::Subject && start.typing());
     match start.row() {
+        Row::Subject if start.typing() => keys.extend([("←→", "change what to tour"), ("type", "a revision")]),
+        Row::Subject => keys.push(("←→", "change what to tour")),
         Row::Agent => keys.push(("←→", "change guide")),
         Row::Model => keys.push(("type", "a model name, empty for the default")),
         Row::Instructions => keys.push(("type", "what the new tour should focus on")),
         Row::Continue | Row::New => {}
     }
     keys.push(("Enter", if start.row() == Row::Instructions { "plan with them" } else { "start" }));
-    if !matches!(start.row(), Row::Model | Row::Instructions) {
+    if !typing {
         keys.push(("q", "quit"));
     }
     keys
@@ -850,13 +940,29 @@ mod tests {
         let note = |line, text: &str, detail: &str| Note { path: "x.rs".into(), line, text: text.into(), detail: detail.into() };
         let notes = [note(1, "short", ""), note(2, "a much longer note that does not fit after the line", ""), note(3, "ok", "why")];
         let marks = Marks { range: Some((1, 3)), ..Default::default() };
-        let (lines, more) = code_lines(&file, &notes, 0, 10, 30, marks);
+        let (lines, more) = code_lines(&file, &notes, None, 0, 10, 30, marks);
         assert_eq!(more, [(2, true), (3, false)]);
         let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert_eq!(text[0], "1▌fn a() {  ◂ short");
         assert!(text[1].starts_with("2▌    b();  ◂ a much") && text[1].ends_with('…'), "{text:?}");
         assert_eq!(text[2], "3▌}  ◂ ok");
         assert!(text.iter().all(|l| display_width(l) <= 30), "{text:?}");
+    }
+
+    #[test]
+    fn marks_changed_lines() {
+        use crate::diff::UNCHANGED;
+        use std::collections::{BTreeMap, BTreeSet};
+        let file: Vec<StyledLine> = ["a", "b", "c"].iter().map(|l| vec![Span::raw(*l)]).collect();
+        let changes = FileChanges {
+            added: BTreeSet::from([1, 2]),
+            removed: BTreeMap::from([(1, vec!["x".into()]), (4, vec!["end".into()])]),
+            ..UNCHANGED.clone()
+        };
+        let (lines, _) = code_lines(&file, &[], Some(&changes), 0, 10, 30, Marks::default());
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        // Lines removed after the last one show on it.
+        assert_eq!(text, ["1± a", "2+ b", "3- c"]);
     }
 
     #[test]

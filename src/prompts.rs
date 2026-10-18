@@ -2,9 +2,11 @@ use std::fmt::Write as _;
 
 use crate::tour::{Anchor, Stop, Tour};
 
-pub const PLANNER: &str = r#"You are the planner for tourer, a tool that gives guided tours of a folder or codebase to someone who has never seen it. The working directory is the folder to tour. Explore it with your read-only tools and write the tour.
+const PLANNER_FOLDER: &str = "You are the planner for tourer, a tool that gives guided tours of a folder or codebase to someone who has never seen it. The working directory is the folder to tour. Explore it with your read-only tools and write the tour.\n\n";
 
-Output format (strict): output ONLY JSON objects, one per line. No prose, no code fences, no blank commentary.
+const PLANNER_DIFF: &str = "You are the planner for tourer, a tool that gives guided tours of code to someone who has not seen it. This tour is of a change: the first message gives the diff between a git commit and the files in the working directory. Explore the folder with your read-only tools to understand the change and the code around it, and write the tour. The files you read are the new versions; the old lines are only in the diff.\n\n";
+
+const PLANNER_FORMAT: &str = r#"Output format (strict): output ONLY JSON objects, one per line. No prose, no code fences, no blank commentary.
 First line:
 {"type":"tour","title":"<short name>","summary":"<one or two sentences: what this folder is>"}
 Then one line per stop, in tour order:
@@ -18,7 +20,9 @@ Write each line as soon as that stop is ready, so the person can start reading w
 If you later learn that an earlier stop is wrong or misleading, correct it with an update line. It replaces only the fields it gives; stops are numbered from 1:
 {"type":"update","stop":<number>,"body":"<corrected markdown>"}
 Any of title, body, anchors, notes and suggested can be given. Only correct real mistakes or gaps; do not rewrite for style.
+"#;
 
+const FOLDER_STOPS: &str = r#"
 How to build a good tour:
 - Stop 1 is an overview: what this is, how it is laid out, how to build, run or use it.
 - Then follow the order a newcomer needs: entry points, core concepts and data, the main flows, then supporting pieces. Use 6 to 12 stops, fewer for small folders.
@@ -28,11 +32,36 @@ How to build a good tour:
 - suggested: 2 or 3 questions a newcomer would likely ask next at this stop, answerable from the code.
 "#;
 
+const DIFF_STOPS: &str = r#"
+How to build a good tour of a change:
+- Stop 1 is an overview: what the change does and why, as far as the code shows, and how the changed files group together.
+- Then follow the order a reviewer needs: the heart of the change first (new or changed data, types and interfaces), then the code that uses it, then supporting changes such as tests, configuration and docs. Group related hunks from different files into one stop. Mention trivial changes (formatting, renames, imports) together instead of giving them stops. Use 3 to 10 stops, fewer for small changes.
+- body: 80 to 200 words of markdown. Say what the code did before and what it does now, why that matters, and what a reviewer should check: changed behavior, edge cases, callers that were not updated, missing tests. Cite code as [relative/path:start-end] in the current version of the file. Removed lines have no current line numbers: describe them or quote them briefly.
+- anchors: 1 to 3 line ranges (5 to 60 lines each) of current files that cover the changed lines with a little context. Line numbers are 1-based, inclusive and must be exact. Cite each anchor in the body, in the sentence that explains it: the anchors are not shown on their own. A deleted file has no anchors.
+- notes: 2 to 6 comments on single changed lines inside the anchors, shown next to that line in the code view. Point out what is easy to miss: a changed condition, a new invariant, what replaced removed code. text: usually under 12 words, at most 40; never restate what the line plainly says. detail: shown when the person hovers the note; 1 to 3 plain sentences (no markdown) that explain it further: what the line did before, why it changed, or what could break.
+- suggested: 2 or 3 questions a reviewer would likely ask next at this stop, answerable from the code.
+"#;
+
+/// The planner's system prompt, for a tour of the whole folder or of a change to it.
+pub fn planner(diff: bool) -> String {
+    match diff {
+        false => [PLANNER_FOLDER, PLANNER_FORMAT, FOLDER_STOPS].concat(),
+        true => [PLANNER_DIFF, PLANNER_FORMAT, DIFF_STOPS].concat(),
+    }
+}
+
 /// The planner's first message, with the person's instructions for the tour if they gave any.
-pub fn planner_start(instructions: &str) -> String {
-    let mut s = String::from("Plan the tour of this folder.");
+/// A diff tour also gets `diff`: where the changes start, and the changed files with the diff.
+pub fn planner_start(instructions: &str, diff: Option<(&str, &str)>) -> String {
+    let mut s = match diff {
+        Some((about, _)) => format!("Plan the tour of {about}: the difference between that commit and the files on disk now."),
+        None => String::from("Plan the tour of this folder."),
+    };
     if !instructions.trim().is_empty() {
         let _ = write!(s, " The person gave these instructions for the tour; follow them:\n\n{}", instructions.trim());
+    }
+    if let Some((_, changes)) = diff {
+        let _ = write!(s, "\n\n{changes}");
     }
     s
 }
@@ -42,7 +71,7 @@ pub fn planner_continue(stops: usize) -> String {
     format!("Your turn ended after {stops} stops without the done line. Continue the tour from stop {}, or write the done line if it is complete.", stops + 1)
 }
 
-pub const GUIDE: &str = r#"You are the guide in tourer, a tool that gives guided tours of a folder or codebase to someone who has never seen it. The working directory is that folder. A separate planner wrote the tour's stops; you answer the questions asked along the way.
+const GUIDE: &str = r#"You are the guide in tourer, a tool that gives guided tours of a folder or codebase to someone who has never seen it. The working directory is that folder. A separate planner wrote the tour's stops; you answer the questions asked along the way.
 
 Messages start with a bracketed context block: in your first message, the person's instructions for the tour if they gave any; stops that are new or changed since your last message (all of them in your first message), then which stop the person is at and the question's number there, and sometimes code they selected. Questions may be about that stop or about anything else in the folder.
 
@@ -57,13 +86,24 @@ Messages start with a bracketed context block: in your first message, the person
 - End every answer with a line containing exactly <<next>> followed by 2 or 3 short follow-up questions they would likely want to ask next, one per line.
 "#;
 
+const GUIDE_DIFF: &str = "
+This tour is of a change: the diff between a git commit and the files in the working directory, given in your first message. The files you read are the new versions; old lines exist only in the diff, so cite current lines and quote removed ones. Answer like a careful reviewer: when asked whether a change is right, safe or complete, check its callers, its tests and the code it replaced.
+";
+
+/// The guide's system prompt, for a tour of the whole folder or of a change to it.
+pub fn guide(diff: bool) -> String {
+    if diff { [GUIDE, GUIDE_DIFF].concat() } else { GUIDE.to_string() }
+}
+
 /// A question for the guide: question `e` at stop `s` (both 0-based). A new conversation
-/// (`fresh`) is told the person's instructions for the tour; `changed` are the stops the guide
-/// has not seen in their current form; `code` is the selected code with its lines.
+/// (`fresh`) is told the person's instructions for the tour; `diff` is the change a diff tour
+/// is about (where it starts, and the diff), given only to a new conversation; `changed` are
+/// the stops the guide has not seen in their current form; `code` is the selected code with its lines.
 pub fn question(
     tour: &Tour,
     (s, e): (usize, usize),
     fresh: bool,
+    diff: Option<(&str, &str)>,
     changed: &[(usize, &Stop)],
     code: Option<(&Anchor, &str)>,
 ) -> String {
@@ -72,6 +112,9 @@ pub fn question(
     let instructions = tour.instructions.trim();
     if fresh && !instructions.is_empty() {
         let _ = writeln!(m, "The person gave these instructions for the tour; keep to them:\n{instructions}\n");
+    }
+    if let Some((about, changes)) = diff {
+        let _ = writeln!(m, "This tour is of {about}.\n{changes}");
     }
     if !changed.is_empty() {
         m.push_str("Stops new or changed since your last message:\n");
@@ -94,12 +137,12 @@ mod tests {
 
     #[test]
     fn passes_instructions_to_the_planner_and_a_new_guide() {
-        assert_eq!(planner_start("  "), "Plan the tour of this folder.");
-        assert!(planner_start("focus on the parser").ends_with("\n\nfocus on the parser"));
+        assert_eq!(planner_start("  ", None), "Plan the tour of this folder.");
+        assert!(planner_start("focus on the parser", None).ends_with("\n\nfocus on the parser"));
         let tour = r#"{"version":1,"root":"","title":"T","summary":"S","instructions":"answer in Turkish",
             "stops":[{"title":"A","body":"b","thread":[{"q":"why?","a":""}]}]}"#;
         let tour: Tour = serde_json::from_str(tour).unwrap();
-        assert!(question(&tour, (0, 0), true, &[], None).contains("answer in Turkish"));
-        assert!(!question(&tour, (0, 0), false, &[], None).contains("answer in Turkish"));
+        assert!(question(&tour, (0, 0), true, None, &[], None).contains("answer in Turkish"));
+        assert!(!question(&tour, (0, 0), false, None, &[], None).contains("answer in Turkish"));
     }
 }

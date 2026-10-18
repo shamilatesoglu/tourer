@@ -13,9 +13,33 @@ pub struct Tour {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instructions: String,
     pub stops: Vec<Stop>,
+    /// Set when the tour is of the changes since a git revision rather than the whole folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffBase>,
     /// The guide's conversation, kept so it can be continued after a restart.
     #[serde(default)]
     pub guide: GuideMemory,
+}
+
+/// Where a diff tour's changes start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffBase {
+    /// The revision as it was asked for, e.g. "main".
+    pub rev: String,
+    /// The commit the changes are measured from: where `rev` and HEAD met when it was planned.
+    pub commit: String,
+}
+
+impl DiffBase {
+    /// "the changes since main (1a2b3c4)".
+    pub fn describe(&self) -> String {
+        let short = crate::diff::short(&self.commit);
+        if self.commit.starts_with(&self.rev) {
+            format!("the changes since {short}")
+        } else {
+            format!("the changes since {} ({short})", self.rev)
+        }
+    }
 }
 
 /// What the guide's saved conversation knows, so each question only tells it what changed.

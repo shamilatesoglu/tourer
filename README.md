@@ -45,8 +45,8 @@ sent to that agent's provider just as it would be if you used the agent directly
 tourer path/to/folder
 ```
 
-The start screen lets you continue the folder's saved tour or plan a new one, and pick the
-agent and model. Your choice is remembered.
+The start screen lets you pick what to tour, continue its saved tour or plan a new one, and
+pick the agent and model. The agent and model are remembered.
 
 | Key | |
 | --- | --- |
@@ -67,10 +67,31 @@ right now.
 Options:
 
 ```
-tourer [FOLDER] [--agent claude|codex] [--model NAME] [--replan] [--out tour.json]
+tourer [FOLDER] [--diff [REV]] [--agent claude|codex] [--model NAME] [--replan] [--out tour.json]
 ```
 
 `--out` writes the whole tour, with questions and answers, as JSON when you quit.
+
+### Tour a change
+
+A tour can cover a change instead of the whole folder, the way a colleague would walk you
+through a pull request: what it does, the heart of it first, then what uses it, and what a
+reviewer should check. In a git repository, the start screen's Tour row offers the
+uncommitted changes, the branch's own changes, or the changes since a revision you type;
+use `←` / `→` to pick. `--diff` picks one from the command line:
+
+```sh
+tourer --diff main       # this branch's changes since it left main
+tourer --diff HEAD~3     # the last three commits
+tourer --diff            # the uncommitted changes
+```
+
+The changes run from where the revision meets HEAD to the files on disk, so uncommitted and
+untracked files are included. In the code pane, `+` marks added lines, `-` marks lines with
+removed code just above them, and `±` both; hover one (or move the cursor to it) to see the
+removed lines. The file picker lists changed files first, and edits you make during the tour
+show up in the code pane. Each revision gets its own saved tour; the start screen tells you
+when the revision has moved since the tour was planned, e.g. after a rebase.
 
 ## How it works
 

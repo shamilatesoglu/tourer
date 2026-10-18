@@ -9,8 +9,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Agent, Event, Memory, Session, Usage};
+use crate::diff;
 use crate::prompts;
-use crate::tour::{self, Anchor, Exchange, PlanLine, StopUpdate, Tour, Update};
+use crate::tour::{self, Anchor, DiffBase, Exchange, PlanLine, StopUpdate, Tour, Update};
 
 /// How often a planner that ends its turn without the done line is asked to go on.
 const MAX_PLAN_CONTINUES: u32 = 3;
@@ -69,6 +70,8 @@ impl State {
 
 pub struct Engine {
     root: PathBuf,
+    /// For a diff tour, the revision whose changes it tours.
+    diff: Option<String>,
     agent: Agent,
     model: Option<String>,
     tx: Sender<(Tag, Event)>,
@@ -89,10 +92,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Starts planning a tour of `root`, or continues `saved`. Agent events arrive on the
-    /// receiver paired with `tx` and must be passed to [`Engine::on_agent`].
+    /// Starts planning a tour of `root`, or of its changes since the git revision `diff`, or
+    /// continues `saved`. Agent events arrive on the receiver paired with `tx` and must be
+    /// passed to [`Engine::on_agent`].
     pub fn new(
         root: PathBuf,
+        diff: Option<String>,
         agent: Agent,
         model: Option<String>,
         tx: Sender<(Tag, Event)>,
@@ -100,6 +105,7 @@ impl Engine {
     ) -> Result<Self> {
         let mut engine = Engine {
             root,
+            diff,
             agent,
             model,
             tx,
@@ -152,26 +158,42 @@ impl Engine {
     }
 
     fn plan(&mut self, instructions: String) -> Result<()> {
+        // A diff tour starts where its revision and HEAD meet now, which may have moved.
+        let (base, changes) = match &self.diff {
+            Some(rev) => {
+                let base = DiffBase { rev: rev.clone(), commit: diff::base(&self.root, rev)? };
+                let changes = diff::changes(&self.root, &base.commit)?;
+                if changes.is_empty() {
+                    anyhow::bail!("nothing changed since {rev}");
+                }
+                let changes = (base.describe(), changes.for_prompt());
+                (Some(base), Some(changes))
+            }
+            None => (None, None),
+        };
+        let start = prompts::planner_start(&instructions, changes.as_ref().map(|(a, c)| (a.as_str(), c.as_str())));
         let root = self.root.display().to_string();
-        self.state.tour = Tour { version: 1, root, instructions, ..Default::default() };
+        self.state.tour = Tour { version: 1, root, instructions, diff: base, ..Default::default() };
         self.state.planning = true;
         self.state.planner_activity = "starting".into();
         (self.plan_done, self.plan_continues) = (false, 0);
         let mut planner = self.spawn(Role::Planner)?;
-        planner.send(&prompts::planner_start(&self.state.tour.instructions))?;
+        planner.send(&start)?;
         self.planner = Some(planner);
         Ok(())
     }
 
     fn spawn(&self, role: Role) -> Result<Session> {
+        let is_diff = self.diff.is_some();
         let (system_prompt, memory) = match role {
-            Role::Planner => (prompts::PLANNER, Memory::None),
+            Role::Planner => (prompts::planner(is_diff), Memory::None),
             Role::Guide => match &self.state.tour.guide.session {
-                Some(id) => (prompts::GUIDE, Memory::Resume(id)),
-                None => (prompts::GUIDE, Memory::Keep),
+                Some(id) => (prompts::guide(is_diff), Memory::Resume(id)),
+                None => (prompts::guide(is_diff), Memory::Keep),
             },
         };
-        let opts = agent::Options { cwd: &self.root, system_prompt, model: self.model.as_deref(), memory };
+        let opts =
+            agent::Options { cwd: &self.root, system_prompt: &system_prompt, model: self.model.as_deref(), memory };
         Session::spawn(self.agent, Tag { role, generation: self.generation }, &opts, self.tx.clone())
     }
 
@@ -435,8 +457,21 @@ impl Engine {
         let ex = &stop.thread[e];
         let lines = ex.code.as_ref().map(|a| self.lines(a));
         let code = ex.code.as_ref().zip(lines.as_deref());
-        // A new conversation has seen no stops yet.
-        prompts::question(tour, (s, e), known.is_empty(), &changed, code)
+        // A new conversation has seen no stops yet. A diff tour's changes go in its first
+        // message, which tells it the whole tour.
+        let fresh = known.is_empty();
+        let diff = match (&tour.diff, fresh) {
+            (Some(base), true) => {
+                let changes = match diff::changes(&self.root, &base.commit) {
+                    Ok(changes) => changes.for_prompt(),
+                    Err(err) => format!("The changes could not be read: {err:#}"),
+                };
+                Some((base.describe(), changes))
+            }
+            _ => None,
+        };
+        let diff = diff.as_ref().map(|(about, changes)| (about.as_str(), changes.as_str()));
+        prompts::question(tour, (s, e), fresh, diff, &changed, code)
     }
 
     /// The text of an anchor's lines, at most 200 of them.
