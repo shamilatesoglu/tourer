@@ -107,6 +107,9 @@ pub struct CodeView {
     /// Set while drawing.
     pub lines: usize,
     pub height: usize,
+    /// Lines whose notes say more than the line shows, so they get a popup, and whether the
+    /// notes' text was cut to fit.
+    pub more_notes: Vec<(usize, bool)>,
 }
 
 impl CodeView {
@@ -293,6 +296,7 @@ impl TourView {
                 flash: None,
                 lines: 0,
                 height: 0,
+                more_notes: vec![],
             },
             focus: Pane::Text,
             zoomed: false,

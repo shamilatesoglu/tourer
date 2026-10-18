@@ -61,7 +61,7 @@ agent and model. Your choice is remembered.
 | `q` | quit |
 
 The mouse works too: click links, suggestions and progress marks, select code by dragging,
-and hover a noted line to read its note. The bottom bar always shows the keys that work
+and hover a note on a line of code for a longer explanation. The bottom bar always shows the keys that work
 right now.
 
 Options:

@@ -8,7 +8,7 @@ Output format (strict): output ONLY JSON objects, one per line. No prose, no cod
 First line:
 {"type":"tour","title":"<short name>","summary":"<one or two sentences: what this folder is>"}
 Then one line per stop, in tour order:
-{"type":"stop","title":"<short title, no number>","body":"<markdown>","anchors":[{"path":"<relative/path>","start":<line>,"end":<line>}],"notes":[{"path":"<relative/path>","line":<line>,"text":"<comment>"}],"suggested":["<question>", "..."]}
+{"type":"stop","title":"<short title, no number>","body":"<markdown>","anchors":[{"path":"<relative/path>","start":<line>,"end":<line>}],"notes":[{"path":"<relative/path>","line":<line>,"text":"<comment>","detail":"<explanation>"}],"suggested":["<question>", "..."]}
 
 After the last stop, a final line:
 {"type":"done"}
@@ -24,7 +24,7 @@ How to build a good tour:
 - Then follow the order a newcomer needs: entry points, core concepts and data, the main flows, then supporting pieces. Use 6 to 12 stops, fewer for small folders.
 - body: 80 to 200 words of markdown. Explain why things are the way they are, not only what they are. Cite code as [relative/path:start-end].
 - anchors: 1 to 3 line ranges (5 to 60 lines each) that you actually read. Line numbers are 1-based, inclusive and must be exact. Cite each anchor in the body, in the sentence that explains it: the anchors are not shown on their own.
-- notes: 2 to 6 comments on single lines inside the anchors, shown next to that line in the code view. Point out what a newcomer would miss: a non-obvious call, an invariant, where a value comes from. Usually under 12 words, at most 40. Never restate what the line plainly says.
+- notes: 2 to 6 comments on single lines inside the anchors, shown next to that line in the code view. Point out what a newcomer would miss: a non-obvious call, an invariant, where a value comes from. text: usually under 12 words, at most 40; never restate what the line plainly says. detail: shown when the person hovers the note; 1 to 3 plain sentences (no markdown) that explain it further: why the line is there, what happens at runtime, what would break without it, or where to look next.
 - suggested: 2 or 3 questions a newcomer would likely ask next at this stop, answerable from the code.
 "#;
 
@@ -49,7 +49,7 @@ Messages start with a bracketed context block: in your first message, the person
 - Ground every answer in the actual files: read and search instead of guessing. If something is not in the folder, say so.
 - Be concise: usually under 200 words of markdown. Lead with the direct answer.
 - Cite code as [relative/path:start-end] with exact 1-based line numbers; these become links the person can open.
-- When the answer points at specific lines, you may add comments shown next to those lines in the code view: after the answer, a line containing exactly <<notes>>, then one note per line as `relative/path:line: comment`. Keep each under 12 words where possible.
+- When the answer points at specific lines, you may add comments shown next to those lines in the code view: after the answer, a line containing exactly <<notes>>, then one JSON object per line: {"path":"<relative/path>","line":<line>,"text":"<comment, under 12 words where possible>","detail":"<1 to 3 plain sentences shown when the note is hovered>"}.
 - Whenever you find that a stop or one of your earlier answers is wrong, misleading or missing something important, correct it: after the answer, a line containing exactly <<update>>, then one JSON object per line:
   {"type":"update","stop":<number>,"body":"<corrected markdown>"} replaces the fields it gives of a stop: title, body, anchors, notes or suggested, in the same shapes the stops use.
   {"type":"update_answer","stop":<number>,"question":<number>,"text":"<corrected answer>"} replaces an earlier answer, optionally with "notes".

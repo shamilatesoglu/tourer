@@ -90,12 +90,15 @@ impl std::fmt::Display for Anchor {
     }
 }
 
-/// The guide's comment on one line of code, shown next to that line.
+/// An agent's comment on one line of code, shown next to that line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub path: String,
     pub line: usize,
     pub text: String,
+    /// A longer explanation, shown when the note is hovered.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -280,12 +283,17 @@ pub fn split_answer(raw: &str) -> Answer<'_> {
     Answer { text, notes, updates, suggested }
 }
 
-/// "src/a.rs:12: text" or "[src/a.rs:12] text" → a note.
+/// A note as JSON, or as "src/a.rs:12: text" or "[src/a.rs:12] text" without a detail.
 fn parse_note(line: &str) -> Option<Note> {
     static NOTE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^\[?([\w./@+-]+):(\d+)(?:-\d+)?\]?:?\s+(.+)$").unwrap());
+    let line = line.trim();
+    if line.starts_with('{') {
+        return serde_json::from_str(line).ok();
+    }
     let c = NOTE.captures(line)?;
-    Some(Note { path: c[1].to_string(), line: c[2].parse().ok()?, text: c[3].trim().to_string() })
+    let text = c[3].trim().to_string();
+    Some(Note { path: c[1].to_string(), line: c[2].parse().ok()?, text, detail: String::new() })
 }
 
 /// A code reference. Some models write it as a markdown link, `[a.rs:3](a.rs:3)`; the link
@@ -338,10 +346,16 @@ mod tests {
 
     #[test]
     fn splits_answer_notes() {
-        let a = split_answer("Yes.\n<<notes>>\nsrc/a.rs:12: 3 files opened\n- [b.rs:3] loops\n<<next>>\nWhy?");
+        let a = split_answer(concat!(
+            "Yes.\n<<notes>>\nsrc/a.rs:12: 3 files opened\n- [b.rs:3] loops\n",
+            r#"{"path":"c.rs","line":7,"text":"retries","detail":"Up to 3 times."}"#,
+            "\n<<next>>\nWhy?"
+        ));
         assert_eq!(a.text, "Yes.");
-        assert_eq!(a.notes[0], Note { path: "src/a.rs".into(), line: 12, text: "3 files opened".into() });
+        let text = "3 files opened".into();
+        assert_eq!(a.notes[0], Note { path: "src/a.rs".into(), line: 12, text, detail: String::new() });
         assert_eq!(a.notes[1].text, "loops");
+        assert_eq!((a.notes[2].line, a.notes[2].detail.as_str()), (7, "Up to 3 times."));
         assert_eq!(a.suggested, vec!["Why?"]);
     }
 

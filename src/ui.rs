@@ -405,7 +405,7 @@ fn excerpt_lines(view: &mut TourView, stop: &Stop, width: usize) -> Vec<Line<'st
         out.push(Line::from(a.to_string()).dim());
         let lines = (a.end + 1).saturating_sub(a.start);
         let marks = Marks { range: Some((a.start, a.end)), ..Default::default() };
-        out.extend(code_lines(file, &notes, a.start.saturating_sub(1), lines.min(MAX_LINES), width, marks));
+        out.extend(code_lines(file, &notes, a.start.saturating_sub(1), lines.min(MAX_LINES), width, marks).0);
         if lines > MAX_LINES {
             let more = format!("  … {} more; click the reference to open it", count(lines - MAX_LINES, "line"));
             out.push(Line::from(more).dim());
@@ -510,10 +510,11 @@ fn draw_code(f: &mut Frame, view: &mut TourView, area: Rect) {
     };
     let top = view.code.scroll.top();
     let block = pane_block(view, Pane::Code).title(title);
-    let lines = match view.file(&target.path) {
-        None => vec![Line::from("(file not found)").dim()],
+    let (lines, more) = match view.file(&target.path) {
+        None => (vec![Line::from("(file not found)").dim()], vec![]),
         Some(file) => code_lines(file, &notes, top, height, width, marks),
     };
+    view.code.more_notes = more;
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -527,8 +528,8 @@ struct Marks {
     flash: bool,
 }
 
-/// Numbered code lines from `scroll` on. Notes go after their line, cut to fit; the full text
-/// shows in a popup.
+/// Numbered code lines from `scroll` on. Notes go after their line, cut to fit; also returns
+/// the lines whose notes say more than that, and whether their text was cut.
 fn code_lines(
     file: &[StyledLine],
     notes: &[Note],
@@ -536,11 +537,11 @@ fn code_lines(
     height: usize,
     width: usize,
     marks: Marks,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<(usize, bool)>) {
     let digits = file.len().to_string().len();
     let note_style = Style::new().fg(Color::Green).add_modifier(Modifier::ITALIC);
     let within = |r: Option<(usize, usize)>, n: usize| r.is_some_and(|(a, b)| (a..=b).contains(&n));
-    let mut out = vec![];
+    let (mut out, mut more) = (vec![], vec![]);
     for (i, spans) in file.iter().enumerate().skip(scroll).take(height) {
         let n = i + 1;
         let mut number = Span::from(format!("{n:>digits$}"));
@@ -562,43 +563,60 @@ fn code_lines(
         let used = digits + 1 + display_width(&code);
         let mut line = vec![number, gutter];
         line.extend(spans.iter().cloned());
-        let said: Vec<&str> = notes.iter().filter(|note| note.line == n).map(|note| note.text.as_str()).collect();
+        let said: Vec<&Note> = notes.iter().filter(|note| note.line == n).collect();
         if !said.is_empty() {
             let room = width.saturating_sub(used + 4);
-            let text = said.join(" · ");
-            let hint = if room < 6 {
-                " ◂".to_string()
-            } else if display_width(&text) <= room {
+            let text = said.iter().map(|note| note.text.as_str()).collect::<Vec<_>>().join(" · ");
+            let fits = display_width(&text) <= room;
+            if !fits || said.iter().any(|note| !note.detail.is_empty()) {
+                more.push((n, !fits));
+            }
+            let hint = if fits {
                 format!("  ◂ {text}")
             } else {
-                let cut: String = text.chars().take(room.saturating_sub(1)).collect();
-                format!("  ◂ {}…", cut.trim_end())
+                if room < 6 {
+                    " ◂".to_string()
+                } else {
+                    let start: String = text.chars().take(room.saturating_sub(1)).collect();
+                    format!("  ◂ {}…", start.trim_end())
+                }
             };
             line.push(Span::styled(hint, note_style));
         }
         out.push(Line::from(line));
     }
-    out
+    (out, more)
 }
 
-/// The full notes on the line under the mouse, or under the cursor in the focused code pane.
+/// The details of the notes on the line under the mouse, or under the cursor in the focused
+/// code pane, and their text too if it was cut to fit after the line.
 fn draw_note_popup(f: &mut Frame, view: &mut TourView) {
     let area = view.areas.code;
     let hovered = view.hover.filter(|p| area.contains(*p)).and_then(|p| view.code_line_at(p.y));
     let line = hovered.or((view.focus == Pane::Code).then_some(view.code.cursor));
     let (Some(line), Some(target)) = (line, view.code.last.as_ref()) else { return };
+    let Some(&(_, cut)) = view.code.more_notes.iter().find(|(n, _)| *n == line) else { return };
     let Some(stop) = view.state.tour.stops.get(view.current) else { return };
-    let notes: Vec<String> = stop.notes_in(&target.path).iter().filter(|n| n.line == line).map(|n| n.text.clone()).collect();
+    let notes: Vec<&Note> = stop.notes_in(&target.path).into_iter().filter(|n| n.line == line).collect();
     let top = view.code.scroll.top();
     if notes.is_empty() || line <= top || line > top + view.code.height {
         return;
     }
     let width = area.width.saturating_sub(8).min(64);
-    let text: Vec<Line> = notes
-        .iter()
-        .flat_map(|n| textwrap::wrap(n, width.saturating_sub(4) as usize))
-        .map(|l| Line::from(l.into_owned()))
-        .collect();
+    let wrap = |s: &str| -> Vec<Line<'static>> {
+        let lines = textwrap::wrap(s, width.saturating_sub(4) as usize);
+        lines.into_iter().map(|l| Line::from(l.into_owned())).collect()
+    };
+    let mut text: Vec<Line> = vec![];
+    for (i, n) in notes.iter().enumerate() {
+        if i > 0 {
+            text.push(Line::default());
+        }
+        if cut || n.detail.is_empty() {
+            text.extend(wrap(&n.text).into_iter().map(|l| l.green().italic()));
+        }
+        text.extend(wrap(&n.detail));
+    }
     let height = text.len() as u16 + 2;
     let row = area.y + 1 + (line - 1 - top) as u16;
     let y = if row + 1 + height <= area.bottom() { row + 1 } else { row.saturating_sub(height) };
@@ -829,14 +847,15 @@ mod tests {
     #[test]
     fn puts_notes_after_lines_cut_to_fit() {
         let file: Vec<StyledLine> = ["fn a() {", "    b();", "}"].iter().map(|l| vec![Span::raw(*l)]).collect();
-        let note = |line, text: &str| Note { path: "x.rs".into(), line, text: text.into() };
-        let notes = [note(1, "short"), note(2, "a much longer note that does not fit after the line")];
+        let note = |line, text: &str, detail: &str| Note { path: "x.rs".into(), line, text: text.into(), detail: detail.into() };
+        let notes = [note(1, "short", ""), note(2, "a much longer note that does not fit after the line", ""), note(3, "ok", "why")];
         let marks = Marks { range: Some((1, 3)), ..Default::default() };
-        let lines = code_lines(&file, &notes, 0, 10, 30, marks);
+        let (lines, more) = code_lines(&file, &notes, 0, 10, 30, marks);
+        assert_eq!(more, [(2, true), (3, false)]);
         let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert_eq!(text[0], "1▌fn a() {  ◂ short");
         assert!(text[1].starts_with("2▌    b();  ◂ a much") && text[1].ends_with('…'), "{text:?}");
-        assert_eq!(text[2], "3▌}");
+        assert_eq!(text[2], "3▌}  ◂ ok");
         assert!(text.iter().all(|l| display_width(l) <= 30), "{text:?}");
     }
 

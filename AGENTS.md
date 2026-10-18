@@ -62,8 +62,10 @@ in the background, plans the tour as a series of stops, and answers questions at
   first. Scrolling by hand drops the step, and the next ↓ starts from the screen. `view.rs` holds the tour screen's state and input,
   `ui.rs` draws it.
 - Line notes: the planner gives each stop notes on single lines, and the guide can add some after
-  `<<notes>>`. The code pane shows a note after its line, cut to fit, and the whole note in a
-  popup for the line under the mouse or the cursor.
+  `<<notes>>` (one JSON object per line; `path:line: text` is also read). A note has a short
+  text, shown after its line and cut to fit, and a detail of 1–3 sentences. Hovering the line,
+  or putting the cursor on it, shows the detail in a popup, with the text too only if it was
+  cut; a note that fits and has no detail gets no popup.
 - Formatting: a small line-based markdown renderer of our own (`markdown.rs`), so we control wrapping
   and link order. Syntax highlighting uses syntect with bat's "ansi" theme (via two-face), so colors
   come from the terminal palette and work on light and dark themes.
@@ -78,7 +80,7 @@ in the background, plans the tour as a series of stops, and answers questions at
   the code pane); `1`–`4` pick a suggestion row (`?` also asks); `o` list of stops; `f` open
   any file; `z` zoom; `Esc` back; `q` quit.
 - Mouse: click a reference, suggestion, the ask row or a progress mark; click or drag in the code to select
-  lines; hover a noted line for its note; drag the border to resize; the wheel scrolls.
+  lines; hover a noted line for the note's details; drag the border to resize; the wheel scrolls.
 - Daemon log: `daemon.log` next to the saved tours.
 - Demo: `vhs demo/tourer.tape` records the README's `docs/demo.gif`; the tape says how to prepare it.
 - `cargo test` covers markdown rendering (tables, link positions), line notes in the code pane,
