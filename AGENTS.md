@@ -46,19 +46,25 @@ in the background, plans the tour as a series of stops, and answers questions at
 - Simplicity first: no feature, crate or abstraction until it is needed. One crate for now.
 - Diff tours: `--diff [REV]` tours the changes since a git revision instead of the whole folder:
   from where REV meets HEAD (so `main` means a branch's own changes) to the files on disk, so
-  uncommitted and untracked files count and `--diff` alone means the uncommitted changes. The new
-  side is always the folder as it is, so anchors, the code pane and the agents' reads work as in
-  any tour. The agents cannot run git, so `diff.rs` runs it and the diff goes in the planner's
+  uncommitted and untracked files count and `--diff` alone means the uncommitted changes.
+  `--diff OLD..NEW` (or `OLD...NEW`) tours from where OLD meets NEW to NEW. The new side is always
+  a folder of real files, so anchors, the code pane and the agents' reads work as in any tour: the
+  folder as it is, or for `OLD..NEW` a checkout of NEW in the data folder's `checkouts/<commit>`,
+  written with `git read-tree` and `git checkout-index` into a separate index so the repository's
+  own index and work tree are not touched. The engine puts that folder in the state it sends, the
+  agents work in it, and the TUI reads files from it. A new daemon deletes the checkouts no saved
+  tour ends at. The agents cannot run git, so `diff.rs` runs it and the diff goes in the planner's
   first message and in the guide's first message (not the system prompt, which is a command-line
   argument for claude). The prompts swap the newcomer's order for a reviewer's. A tour saves the
-  base commit it was planned from, and each revision has its own tour per agent; the start screen
-  says when the revision no longer meets HEAD there. The code pane marks added
+  commits it was planned from, and each revision has its own tour per agent; the start screen
+  says when the revisions name other commits now. The code pane marks added
   lines `+`, lines with removed ones just above `-`, and both `±`; the removed lines show in the
   note popup, so every screen row stays one line of the file. Changes are read from git again
   whenever they are used, and by the TUI when a file it shows changes on disk.
   - In a git repository the start screen's Tour row picks the folder, the uncommitted changes,
     the branch's own changes since the main branch (`origin/HEAD`, else `main` or `master`), or
-    the changes since a revision typed in. `--diff` preselects it; it is not saved in prefs.
+    the changes since a revision typed in (or between two, typed as `OLD..NEW`). `--diff`
+    preselects it; it is not saved in prefs.
 - Tour format: our own small JSON format (see `src/tour.rs`). CodeTour `.tour` export can be added later.
 - `engine.rs` owns planning and Q&A. A background daemon (`daemon.rs`) hosts one engine per folder,
   so every open TUI (`app.rs`, `ui.rs`) shares the tours and sees the others' questions live. The first front-end that needs the daemon starts it; it runs from a copy of the
@@ -93,7 +99,7 @@ in the background, plans the tour as a series of stops, and answers questions at
   (`--diff`) cover touring a change, but not its history.
 
 ## Running
-- `cargo run -- <folder> [--diff [REV]] [--agent claude|codex] [--model NAME] [--out tour.json] [--replan]` (needs
+- `cargo run -- <folder> [--diff [REV | OLD..NEW]] [--agent claude|codex] [--model NAME] [--out tour.json] [--replan]` (needs
   the agent's CLI on PATH and logged in). `--diff`, `--agent`, `--model` and `--replan` preselect the start
   screen; the agent and model picked there are saved in `prefs.json` next to the tours.
 - Keys: `↑`/`↓` (or `Space`) step through the text, or move the code cursor; `←`/`→` change
@@ -107,6 +113,6 @@ in the background, plans the tour as a series of stops, and answers questions at
 - Demo: `vhs demo/tourer.tape` records the README's `docs/demo.gif`; the tape says how to prepare it.
 - `cargo test` covers markdown rendering (tables, link positions), line notes in the code pane,
   smooth scrolling, the order ↓ steps through, reading git diffs and marking changed lines, what
-  the start screen offers to tour and whether a diff tour's base moved (against a throwaway git
-  repository), tour file names, decoding codex events, unseen-update tracking, and parsing of planner
+  the start screen offers to tour, whether a diff tour's commits moved, and touring and checking
+  out the changes between two revisions (against a throwaway git repository), tour file names, decoding codex events, unseen-update tracking, and parsing of planner
   lines, updates, answers and code references.

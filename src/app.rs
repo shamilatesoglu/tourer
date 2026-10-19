@@ -16,7 +16,7 @@ use crate::view::{Item, TourView};
 pub struct App {
     client: Client,
     pub root: PathBuf,
-    /// For an open tour of the changes since a git revision, that revision.
+    /// For an open tour of the changes between git revisions, those revisions as typed.
     pub diff: Option<String>,
     /// A problem reaching the daemon.
     pub error: Option<String>,
@@ -101,7 +101,7 @@ impl App {
             }
             Some(Action::Start { agent, model, diff, replan, instructions }) => {
                 if let Some(rev) = &diff
-                    && let Err(err) = diff::base(&self.root, rev)
+                    && let Err(err) = diff::resolve(&self.root, rev)
                 {
                     self.error = Some(format!("{err:#}"));
                     return;
@@ -181,7 +181,7 @@ pub enum Subject {
     Uncommitted { files: usize },
     /// The changes since HEAD left the main branch.
     Branch { main: String, commits: usize },
-    /// The changes since a revision the person types.
+    /// The changes since a revision the person types, or between two as "OLD..NEW".
     Since(String),
 }
 

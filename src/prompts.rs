@@ -51,10 +51,10 @@ pub fn planner(diff: bool) -> String {
 }
 
 /// The planner's first message, with the person's instructions for the tour if they gave any.
-/// A diff tour also gets `diff`: where the changes start, and the changed files with the diff.
+/// A diff tour also gets `diff`: which changes it tours, and the changed files with the diff.
 pub fn planner_start(instructions: &str, diff: Option<(&str, &str)>) -> String {
     let mut s = match diff {
-        Some((about, _)) => format!("Plan the tour of {about}: the difference between that commit and the files on disk now."),
+        Some((about, _)) => format!("Plan the tour of {about}."),
         None => String::from("Plan the tour of this folder."),
     };
     if !instructions.trim().is_empty() {
@@ -97,8 +97,8 @@ pub fn guide(diff: bool) -> String {
 
 /// A question for the guide: question `e` at stop `s` (both 0-based). A new conversation
 /// (`fresh`) is told the person's instructions for the tour; `diff` is the change a diff tour
-/// is about (where it starts, and the diff), given only to a new conversation; `changed` are
-/// the stops the guide has not seen in their current form; `code` is the selected code with its lines.
+/// is about (which commits it compares, and the diff), given only to a new conversation;
+/// `changed` are the stops the guide has not seen in their current form; `code` is the selected code with its lines.
 pub fn question(
     tour: &Tour,
     (s, e): (usize, usize),

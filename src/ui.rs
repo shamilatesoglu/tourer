@@ -41,6 +41,14 @@ fn count(n: usize, thing: &str) -> String {
     if n == 1 { format!("1 {thing}") } else { format!("{n} {thing}s") }
 }
 
+/// A typed revision as the start screen names it: "since main", or "main..feature" as typed.
+fn since(rev: &str) -> String {
+    match diff::Range::parse(rev) {
+        diff::Range::Since(_) => format!("since {rev}"),
+        diff::Range::Between(..) => rev.to_string(),
+    }
+}
+
 /// The end of `s` if it is wider than `width`, after an ellipsis.
 fn left_cut(s: &str, width: usize) -> String {
     if display_width(s) <= width {
@@ -74,8 +82,8 @@ fn draw_start(f: &mut Frame, start: &mut Start, root: &str, area: Rect) {
                 Subject::Folder => "folder".to_string(),
                 Subject::Uncommitted { .. } => "uncommitted".to_string(),
                 Subject::Branch { .. } => "this branch".to_string(),
-                Subject::Since(rev) if i == start.subject && row == Row::Subject => format!("since {rev}▏"),
-                Subject::Since(rev) if i == start.subject && !rev.is_empty() => format!("since {rev}"),
+                Subject::Since(rev) if i == start.subject && row == Row::Subject => format!("{}▏", since(rev)),
+                Subject::Since(rev) if i == start.subject && !rev.is_empty() => since(rev),
                 Subject::Since(_) => "since…".to_string(),
             };
             subjects.push(if i == start.subject { Span::from(name).reversed() } else { Span::from(name).dim() });
@@ -88,8 +96,11 @@ fn draw_start(f: &mut Frame, start: &mut Start, root: &str, area: Rect) {
             Subject::Branch { main, commits } => {
                 format!("{} since {main}, and uncommitted changes", count(*commits, "commit"))
             }
-            Subject::Since(rev) if rev.trim().is_empty() => "type a branch, tag or commit".to_string(),
-            Subject::Since(rev) => format!("the changes since {}, and uncommitted ones", rev.trim()),
+            Subject::Since(rev) if rev.trim().is_empty() => "type a branch, tag or commit, or OLD..NEW".to_string(),
+            Subject::Since(rev) => match diff::Range::parse(rev.trim()) {
+                diff::Range::Since(rev) => format!("the changes since {rev}, and uncommitted ones"),
+                diff::Range::Between(old, new) => format!("the changes from {old} to {new}"),
+            },
         };
         lines.push((None, Line::from(format!("{:17}{about}", "")).dim()));
         lines.push((None, Line::from("")));
@@ -112,6 +123,7 @@ fn draw_start(f: &mut Frame, start: &mut Start, root: &str, area: Rect) {
             }
             let again = match base {
                 Some(BaseState::Moved { now, .. }) => format!("plan it again from {}", diff::short(now)),
+                Some(BaseState::EndMoved { now, .. }) => format!("plan it again up to {}", diff::short(now)),
                 _ => "plan it again, replacing this one".to_string(),
             };
             let new = vec![label(Row::New, "New tour"), Span::from(again).dim()];

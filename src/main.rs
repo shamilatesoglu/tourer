@@ -41,6 +41,7 @@ struct Args {
     out: Option<PathBuf>,
     /// Tour the changes since this git revision instead of the whole folder: the changes from
     /// where it meets HEAD to the files on disk. Without a revision, the uncommitted changes.
+    /// OLD..NEW tours the changes from where OLD meets NEW to NEW.
     #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "HEAD")]
     diff: Option<String>,
     /// Throw away the folder's saved tour and plan a new one.
@@ -61,7 +62,7 @@ fn main() -> Result<()> {
     }
     let root = args.path.canonicalize().with_context(|| format!("cannot open {}", args.path.display()))?;
     if let Some(rev) = &args.diff {
-        diff::base(&root, rev)?;
+        diff::resolve(&root, rev)?;
     }
 
     let (client, replies) = daemon::connect()?;

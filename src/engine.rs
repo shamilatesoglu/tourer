@@ -2,7 +2,7 @@
 //! The daemon hosts one per folder and feeds it agent events; front-ends see its [`State`].
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use anyhow::Result;
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{self, Agent, Event, Memory, Session, Usage};
 use crate::diff;
 use crate::prompts;
-use crate::tour::{self, Anchor, DiffBase, Exchange, PlanLine, StopUpdate, Tour, Update};
+use crate::tour::{self, Anchor, Exchange, PlanLine, StopUpdate, Tour, Update};
 
 /// How often a planner that ends its turn without the done line is asked to go on.
 const MAX_PLAN_CONTINUES: u32 = 3;
@@ -47,6 +47,9 @@ pub struct State {
     queue: VecDeque<(usize, usize)>,
     answering: Option<(usize, usize)>,
     pub error: Option<String>,
+    /// For a diff tour that ends at a commit, the toured folder as it is in that commit, which
+    /// the tour shows and its agents read; `None` for the folder itself.
+    pub checkout: Option<PathBuf>,
     /// Tokens used since the tour was opened.
     pub planner_usage: Usage,
     pub guide_usage: Usage,
@@ -70,7 +73,7 @@ impl State {
 
 pub struct Engine {
     root: PathBuf,
-    /// For a diff tour, the revision whose changes it tours.
+    /// For a diff tour, the revisions whose changes it tours, e.g. "main" or "main..feature".
     diff: Option<String>,
     agent: Agent,
     model: Option<String>,
@@ -92,7 +95,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Starts planning a tour of `root`, or of its changes since the git revision `diff`, or
+    /// Starts planning a tour of `root`, or of its changes between the git revisions `diff`, or
     /// continues `saved`. Agent events arrive on the receiver paired with `tx` and must be
     /// passed to [`Engine::on_agent`].
     pub fn new(
@@ -121,6 +124,12 @@ impl Engine {
         };
         match saved {
             Some(tour) => {
+                if let Some(base) = &tour.diff {
+                    match diff::check_out(&engine.root, base) {
+                        Ok(checkout) => engine.state.checkout = checkout,
+                        Err(err) => engine.state.error = Some(format!("{err:#}")),
+                    }
+                }
                 engine.state.tour = tour;
                 // Questions that were still open when the tour was saved.
                 for (s, stop) in engine.state.tour.stops.iter().enumerate() {
@@ -158,14 +167,15 @@ impl Engine {
     }
 
     fn plan(&mut self, instructions: String) -> Result<()> {
-        // A diff tour starts where its revision and HEAD meet now, which may have moved.
+        // A diff tour compares the commits its revisions name now, which may have moved.
         let (base, changes) = match &self.diff {
             Some(rev) => {
-                let base = DiffBase { rev: rev.clone(), commit: diff::base(&self.root, rev)? };
-                let changes = diff::changes(&self.root, &base.commit)?;
+                let base = diff::resolve(&self.root, rev)?;
+                let changes = diff::changes(&self.root, &base)?;
                 if changes.is_empty() {
-                    anyhow::bail!("nothing changed since {rev}");
+                    anyhow::bail!("no changes to tour in {rev}");
                 }
+                self.state.checkout = diff::check_out(&self.root, &base)?;
                 let changes = (base.describe(), changes.for_prompt());
                 (Some(base), Some(changes))
             }
@@ -183,6 +193,11 @@ impl Engine {
         Ok(())
     }
 
+    /// Where the agents work and anchors are read.
+    fn files(&self) -> &Path {
+        self.state.checkout.as_deref().unwrap_or(&self.root)
+    }
+
     fn spawn(&self, role: Role) -> Result<Session> {
         let is_diff = self.diff.is_some();
         let (system_prompt, memory) = match role {
@@ -193,7 +208,7 @@ impl Engine {
             },
         };
         let opts =
-            agent::Options { cwd: &self.root, system_prompt: &system_prompt, model: self.model.as_deref(), memory };
+            agent::Options { cwd: self.files(), system_prompt: &system_prompt, model: self.model.as_deref(), memory };
         Session::spawn(self.agent, Tag { role, generation: self.generation }, &opts, self.tx.clone())
     }
 
@@ -394,9 +409,9 @@ impl Engine {
         }
     }
 
-    /// Shows tool targets relative to the toured folder.
+    /// Shows tool targets relative to the folder the agents work in.
     fn relative(&self, activity: &str) -> String {
-        let prefix = format!("{}/", self.root.display());
+        let prefix = format!("{}/", self.files().display());
         activity.replace(&prefix, "")
     }
 
@@ -462,7 +477,7 @@ impl Engine {
         let fresh = known.is_empty();
         let diff = match (&tour.diff, fresh) {
             (Some(base), true) => {
-                let changes = match diff::changes(&self.root, &base.commit) {
+                let changes = match diff::changes(&self.root, base) {
                     Ok(changes) => changes.for_prompt(),
                     Err(err) => format!("The changes could not be read: {err:#}"),
                 };
@@ -476,7 +491,7 @@ impl Engine {
 
     /// The text of an anchor's lines, at most 200 of them.
     fn lines(&self, a: &Anchor) -> String {
-        let text = std::fs::read(self.root.join(&a.path)).map(|b| String::from_utf8_lossy(&b).into_owned());
+        let text = std::fs::read(self.files().join(&a.path)).map(|b| String::from_utf8_lossy(&b).into_owned());
         let text = text.unwrap_or_default();
         let count = (a.end + 1).saturating_sub(a.start).min(200);
         text.lines().skip(a.start.saturating_sub(1)).take(count).collect::<Vec<_>>().join("\n")

@@ -77,13 +77,14 @@ tourer [FOLDER] [--diff [REV]] [--agent claude|codex] [--model NAME] [--replan] 
 A tour can cover a change instead of the whole folder, the way a colleague would walk you
 through a pull request: what it does, the heart of it first, then what uses it, and what a
 reviewer should check. In a git repository, the start screen's Tour row offers the
-uncommitted changes, the branch's own changes, or the changes since a revision you type;
-use `←` / `→` to pick. `--diff` picks one from the command line:
+uncommitted changes, the branch's own changes, or the changes since a revision you type
+(or between two, as `OLD..NEW`); use `←` / `→` to pick. `--diff` picks one from the command line:
 
 ```sh
 tourer --diff main       # this branch's changes since it left main
 tourer --diff HEAD~3     # the last three commits
 tourer --diff            # the uncommitted changes
+tourer --diff main..pr   # the changes on branch pr since it left main, without checking it out
 ```
 
 The changes run from where the revision meets HEAD to the files on disk, so uncommitted and
@@ -92,6 +93,11 @@ removed code just above them, and `±` both; hover one (or move the cursor to it
 removed lines. The file picker lists changed files first, and edits you make during the tour
 show up in the code pane. Each revision gets its own saved tour; the start screen tells you
 when the revision has moved since the tour was planned, e.g. after a rebase.
+
+`OLD..NEW` tours the changes from where OLD meets NEW to NEW, leaving your own work out. The
+agents cannot run git, so tourer writes NEW's files to a folder of its own (next to the saved
+tours) for them to read; your repository's files and index are not touched. That folder is
+deleted when no saved tour needs it any more.
 
 ## How it works
 

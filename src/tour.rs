@@ -21,23 +21,33 @@ pub struct Tour {
     pub guide: GuideMemory,
 }
 
-/// Where a diff tour's changes start.
+/// The commits a diff tour compares.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiffBase {
-    /// The revision as it was asked for, e.g. "main".
+    /// The revisions as they were asked for, e.g. "main" or "main..feature".
     pub rev: String,
-    /// The commit the changes are measured from: where `rev` and HEAD met when it was planned.
+    /// The commit the changes are measured from: where the old revision met the new one (HEAD
+    /// for "main") when it was planned.
     pub commit: String,
+    /// The commit the changes end at, for "main..feature"; `None` when they end at the files
+    /// on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
 }
 
 impl DiffBase {
-    /// "the changes since main (1a2b3c4)".
+    /// "the changes since main (1a2b3c4), up to the files on disk now", or "the changes from
+    /// main (1a2b3c4) to feature (5d6e7f8)".
     pub fn describe(&self) -> String {
-        let short = crate::diff::short(&self.commit);
-        if self.commit.starts_with(&self.rev) {
-            format!("the changes since {short}")
-        } else {
-            format!("the changes since {} ({short})", self.rev)
+        let name = |rev: &str, commit: &str| {
+            let short = crate::diff::short(commit);
+            if commit.starts_with(rev) { short.to_string() } else { format!("{rev} ({short})") }
+        };
+        match (crate::diff::Range::parse(&self.rev), &self.to) {
+            (crate::diff::Range::Between(old, new), Some(to)) => {
+                format!("the changes from {} to {}", name(old, &self.commit), name(new, to))
+            }
+            _ => format!("the changes since {}, up to the files on disk now", name(&self.rev, &self.commit)),
         }
     }
 }

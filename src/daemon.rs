@@ -1,11 +1,11 @@
 //! The background process that owns every tour, so every open TUI shares them.
 //! Front-ends connect over localhost TCP and exchange one JSON message per line. The first
 //! front-end to need it starts the daemon; it exits after a while without clients.
-//! Each folder has one tour per agent, and one per agent for each git revision whose changes
-//! are toured. Tours are saved to disk and continued when their
+//! Each folder has one tour per agent, and one per agent for each git revision, or pair of
+//! revisions, whose changes are toured. Tours are saved to disk and continued when their
 //! folder is opened again.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -35,7 +35,7 @@ pub enum Request {
     /// Must come first on every connection.
     Hello { token: String, build: String },
     /// Lists a folder's tours, answered with [`Reply::Tours`]. Requests that take `diff` are
-    /// about the tour of the changes since that git revision, if given.
+    /// about the tour of the changes since that git revision, or between "OLD..NEW", if given.
     List { root: PathBuf, diff: Option<String> },
     /// Opens a folder's tour and sends its state now and whenever it changes. A replan follows
     /// `instructions`.
@@ -67,7 +67,7 @@ pub struct TourSummary {
     pub stops: usize,
     pub questions: usize,
     pub planning: bool,
-    /// For a diff tour, whether it still starts where its revision meets HEAD.
+    /// For a diff tour, whether it still compares the commits its revisions name.
     pub base: Option<BaseState>,
 }
 
@@ -267,7 +267,7 @@ impl Shared {
     }
 }
 
-/// Which tour: a folder's, or of its changes since a git revision, by an agent.
+/// Which tour: a folder's, or of its changes since a git revision or between two, by an agent.
 type Key = (PathBuf, Option<String>, Agent);
 
 struct Daemon {
@@ -291,6 +291,7 @@ pub fn run(build: String) -> Result<()> {
     std::fs::write(&tmp, serde_json::to_vec(&addr)?)?;
     std::fs::rename(&tmp, dir.join("daemon.json"))?;
     remove_old_copies(&dir, &build);
+    remove_unused_checkouts(&dir);
     eprintln!("tourer daemon {build} listening on port {port}");
 
     let daemon = Arc::new(Daemon {
@@ -325,6 +326,17 @@ fn remove_old_copies(dir: &Path, build: &str) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Deletes the checkouts of commits that no saved tour ends at. No tour is hosted yet, and
+/// tours replanned since their checkout was written have been saved with their new commits.
+fn remove_unused_checkouts(dir: &Path) {
+    let files = std::fs::read_dir(dir.join("tours")).into_iter().flatten().flatten();
+    let used: BTreeSet<String> = files
+        .filter_map(|entry| serde_json::from_slice::<Tour>(&std::fs::read(entry.path()).ok()?).ok())
+        .filter_map(|tour| tour.diff?.to)
+        .collect();
+    diff::remove_checkouts(&used);
 }
 
 impl Daemon {

@@ -15,7 +15,7 @@ use crate::app::Action;
 use crate::diff::{self, Changes};
 use crate::engine::State;
 use crate::highlight::{Highlighter, StyledLine};
-use crate::tour::Anchor;
+use crate::tour::{Anchor, DiffBase};
 
 /// How often the files shown are checked for changes on disk.
 const CHECK_FILES_EVERY: Duration = Duration::from_secs(2);
@@ -262,11 +262,11 @@ pub struct TourView {
     root: PathBuf,
     pub hl: Highlighter,
     files: HashMap<String, CachedFile>,
-    /// A diff tour's changes, read from git when its base commit is known and again when a
-    /// file shown changes.
+    /// A diff tour's changes, read from git when its commits are known and again when a file
+    /// shown changes.
     pub changes: Option<Rc<Changes>>,
-    /// The commit `changes` start from.
-    changes_from: Option<String>,
+    /// The commits `changes` compare.
+    changes_of: Option<DiffBase>,
     /// When the files shown were last checked for changes on disk.
     checked: Instant,
     /// Every file in the folder, listed when the file picker first opens.
@@ -309,7 +309,7 @@ impl TourView {
             hl: Highlighter::new(),
             files: HashMap::new(),
             changes: None,
-            changes_from: None,
+            changes_of: None,
             checked: Instant::now(),
             all_files: None,
             text: Scroll::default(),
@@ -345,17 +345,26 @@ impl TourView {
     }
 
     pub fn set_state(&mut self, state: State) {
-        let commit = state.tour.diff.as_ref().map(|d| d.commit.clone());
-        if commit != self.changes_from {
-            self.changes_from = commit;
+        if state.checkout != self.state.checkout {
+            self.files.clear();
+            self.all_files = None;
+        }
+        if state.tour.diff != self.changes_of {
+            self.changes_of = state.tour.diff.clone();
             self.read_changes();
         }
         self.state = state;
     }
 
     fn read_changes(&mut self) {
-        let commit = self.changes_from.as_deref();
-        self.changes = commit.and_then(|c| diff::changes(&self.root, c).ok()).map(Rc::new);
+        let base = self.changes_of.as_ref();
+        self.changes = base.and_then(|b| diff::changes(&self.root, b).ok()).map(Rc::new);
+    }
+
+    /// Where the tour's files are read: the folder, or the checkout of the commit a diff tour
+    /// ends at.
+    fn files_dir(&self) -> &Path {
+        self.state.checkout.as_deref().unwrap_or(&self.root)
     }
 
     /// Forgets the files shown that changed on disk, so they are read again, and then reads a
@@ -366,20 +375,22 @@ impl TourView {
         }
         self.checked = Instant::now();
         let before = self.files.len();
-        let root = &self.root;
-        self.files.retain(|path, file| modified(&root.join(path)) == file.modified);
-        if self.files.len() < before && self.changes_from.is_some() {
+        let dir = self.files_dir().to_path_buf();
+        self.files.retain(|path, file| modified(&dir.join(path)) == file.modified);
+        if self.files.len() < before && self.changes_of.is_some() {
             self.read_changes();
         }
     }
 
     /// A file's highlighted lines, cached until the file changes.
     pub fn file(&mut self, path: &str) -> Option<&Vec<StyledLine>> {
-        let (root, hl) = (&self.root, &self.hl);
+        // Not `files_dir`, which would borrow all of `self`.
+        let dir = self.state.checkout.as_deref().unwrap_or(&self.root);
+        let hl = &self.hl;
         self.files
             .entry(path.to_string())
             .or_insert_with(|| {
-                let file = root.join(path);
+                let file = dir.join(path);
                 let modified = modified(&file);
                 let lines = std::fs::read(&file).ok().map(|bytes| hl.file(path, &String::from_utf8_lossy(&bytes)));
                 CachedFile { modified, lines }
@@ -540,8 +551,8 @@ impl TourView {
     /// The folder's files whose paths contain every word of `query`: in a diff tour the changed
     /// ones first, then shortest first.
     pub fn matching_files(&mut self, query: &str) -> Vec<String> {
-        let root = self.root.clone();
-        let all = self.all_files.get_or_insert_with(|| list_files(&root));
+        let dir = self.files_dir().to_path_buf();
+        let all = self.all_files.get_or_insert_with(|| list_files(&dir));
         let words: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
         let mut found: Vec<String> =
             all.iter().filter(|p| words.iter().all(|w| p.to_lowercase().contains(w))).cloned().collect();
